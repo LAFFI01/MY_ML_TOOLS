@@ -9,6 +9,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+# Enable experimental HalvingGridSearchCV
+from sklearn.experimental import enable_halving_search_cv  # noqa: F401
+
 # Imblearn Pipeline alias to protect against Scikit-Learn overrides
 from imblearn.pipeline import Pipeline as ImbPipeline
 
@@ -16,16 +19,28 @@ from imblearn.pipeline import Pipeline as ImbPipeline
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     accuracy_score,
+    auc,
     classification_report,
+    cohen_kappa_score,
     f1_score,
+    log_loss,
+    matthews_corrcoef,
     mean_absolute_error,
+    mean_absolute_percentage_error,
     mean_squared_error,
+    mean_squared_log_error,
+    precision_recall_curve,
+    precision_score,
     r2_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
 )
 
 # Model Selection & Splitters
 from sklearn.model_selection import (
     GridSearchCV,
+    HalvingGridSearchCV,
     KFold,
     RandomizedSearchCV,
     StratifiedKFold,
@@ -42,15 +57,6 @@ from sklearn.model_selection import (
 def _validate_inputs(X: pd.DataFrame, y: pd.Series, test_size: float, val_size: float) -> None:
     """
     Validate input data and parameters.
-
-    Args:
-        X: Feature dataframe
-        y: Target series
-        test_size: Test set fraction
-        val_size: Validation set fraction
-
-    Raises:
-        ValueError: If inputs are invalid
     """
     if X.shape[0] != y.shape[0]:
         raise ValueError(
@@ -81,13 +87,6 @@ def _get_preprocessor(
 ) -> Optional[Any]:
     """
     Extract the preprocessor for a given model.
-
-    Args:
-        preprocess_pipeline: Single pipeline or dict of pipelines
-        model_name: Name of the model
-
-    Returns:
-        The preprocessor for this model, or None
     """
     if isinstance(preprocess_pipeline, dict):
         return preprocess_pipeline.get(model_name, preprocess_pipeline.get("default"))
@@ -97,14 +96,6 @@ def _get_preprocessor(
 def _build_pipeline(preprocessor: Optional[Any], sampler: Optional[Any], model: Any) -> ImbPipeline:
     """
     Build a pipeline with preprocessor, sampler, and model.
-
-    Args:
-        preprocessor: Optional preprocessing pipeline
-        sampler: Optional sampling strategy (e.g., SMOTE)
-        model: The ML model
-
-    Returns:
-        ImbPipeline with all components
     """
     steps = []
     if preprocessor is not None:
@@ -126,14 +117,6 @@ def _extract_feature_importance(
     """
     Extract feature importance/coefficients from a trained pipeline.
     Returns a dict with feature names and their importance percentages.
-
-    Args:
-        pipeline: Trained ImbPipeline
-        feature_names: Original feature names
-        top_k: Number of top features to return
-
-    Returns:
-        Dict with feature names as keys and percentage importance as values
     """
     fitted_model = pipeline.named_steps.get("model")
     if fitted_model is None:
@@ -200,10 +183,8 @@ def _extract_feature_importance(
 def evaluate_and_plot_models(
     models: Dict[str, Any],
     preprocess_pipeline: Union[Any, Dict[str, Any]],
-    # --- NEW: Master Data Inputs ---
     X: pd.DataFrame,
     y: pd.Series,
-    # --- NEW: Splitting Parameters ---
     test_size: float = 0.2,
     val_size: float = 0.0,
     split_method: str = "random",  # 'random' or 'sequential'
@@ -226,12 +207,79 @@ def evaluate_and_plot_models(
     plot_comparison: bool = True,
     top_n_features: int = 20,
     save_dir: Optional[str] = None,
+    resume: bool = False,         # <--- NEW: State check parameter
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
     Enterprise machine learning evaluation pipeline.
+    
     Handles internal data splitting, automated tuning, imbalanced sampling,
-    and cross-validation for both classification and regression tasks.
+    cross-validation, and mid-training state checkpointing for both 
+    classification and regression tasks. Supports resumable training with 
+    checkpoint persistence.
+
+    Args:
+        models: Dictionary of model name -> model instance mappings.
+        preprocess_pipeline: Single preprocessing pipeline or dict mapping 
+            model names to their respective pipelines. Use "default" key as fallback.
+        X: Feature dataframe with shape (n_samples, n_features).
+        y: Target series with shape (n_samples,).
+        test_size: Fraction of data for test set [0.0, 1.0]. Default: 0.2.
+        val_size: Fraction of training data for validation set [0.0, 1.0). 
+            Default: 0.0 (no validation set).
+        split_method: Either "random" (standard shuffle split) or "sequential" 
+            (time series/financial data - no shuffling). Default: "random".
+        stratify: Whether to stratify splits by target (classification only). 
+            Default: True.
+        random_seed: Random state for reproducibility. Default: 42.
+        task_type: Either "classification" or "regression". Default: "classification".
+        target_names: List of target class names for classification reports. Default: None.
+        feature_names: List of original feature names for importance plots. Default: None.
+        param_grids: Dictionary mapping model names to parameter grids for hyperparameter 
+            tuning. If None, models train with default parameters. Default: None.
+        fit_params: Dictionary mapping model names to fit keyword arguments 
+            (e.g., early stopping). Default: None.
+        sampler: Imbalanced data sampler (e.g., SMOTE). Applied to all models. 
+            Ignored for regression. Default: None.
+        cv: Number of cross-validation folds. Default: 4.
+        search_type: Hyperparameter search method: "grid", "random", or "halving". 
+            "halving" uses successive halving for efficient large-scale tuning. Default: "grid".
+        primary_metric: Metric to optimize ("accuracy", "f1", "r2", etc.). 
+            Auto-selected if None. Default: None.
+        top_k: Filter to top-k models after quick screening phase. 
+            If None, all models evaluated. Default: None.
+        quick_test_fraction: Fraction of training data used in screening phase. 
+            Default: 0.2.
+        plot_lc: Whether to generate learning curves. Default: True.
+        plot_diagnostics: Whether to generate confusion matrices/residual plots. 
+            Default: True.
+        plot_importance: Whether to display feature importance/coefficients. 
+            Default: True.
+        plot_comparison: Whether to generate boxplot comparison of all models. 
+            Default: True.
+        top_n_features: Number of top features to display in importance plot. 
+            Default: 20.
+        save_dir: Directory to save models and checkpoint files. 
+            If None, no models saved. Default: None.
+        resume: If True and checkpoint exists, resume training from last completed 
+            model. If False, start fresh. Default: False.
+        verbose: Whether to print progress messages. Default: True.
+
+    Returns:
+        Dictionary containing:
+        - "summary_df": DataFrame with ranked model performance metrics.
+        - "best_models": Dict mapping model names to fitted pipeline objects.
+        - "raw_cv_scores": Dict mapping model names to cross-validation score arrays.
+        - "ultimate_winner": Best performing model's fitted pipeline.
+        - "data_splits": Dict with train/val/test splits for post-processing:
+            {"X_train", "y_train", "X_val", "y_val", "X_test", "y_test"}
+
+    Notes:
+        - Checkpoint files are auto-saved to save_dir/eval_checkpoint.pkl after 
+          each model completes. Use resume=True to continue from interruption.
+        - For gradient boosting models (XGBoost, LightGBM, CatBoost), validation 
+          set is auto-injected into fit_params if val_size > 0.0.
+        - IPython.display is optional; falls back to pandas.to_string() if unavailable.
     """
 
     def vprint(text):
@@ -310,9 +358,6 @@ def evaluate_and_plot_models(
     else:
         vprint(f"Data Shapes -> Train: {X_train.shape}, Test: {X_test.shape}")
 
-    # Note: Cross-validation uses X_train. The internal X_val is returned in the final dict
-    # for advanced users who need a clean holdout set for external post-processing.
-
     # ==============================================================================
     # PHASE 1: QUICK SCREENING
     # ==============================================================================
@@ -370,15 +415,38 @@ def evaluate_and_plot_models(
         models = {name: models[name] for name in top_model_names}
 
     # ==============================================================================
+    # 💾 NEW: CHECKPOINT LOADING ENGINE
+    # ==============================================================================
+    checkpoint_file = os.path.join(save_dir, "eval_checkpoint.pkl") if save_dir else None
+
+    if resume and checkpoint_file and os.path.exists(checkpoint_file):
+        vprint("\n" + "=" * 70)
+        vprint(f"💾 RESUMING PREVIOUS RUN FROM CHECKPOINT...")
+        vprint("=" * 70)
+        state = joblib.load(checkpoint_file)
+        results_score = state.get("results_score", [])
+        test_scores_list = state.get("test_scores_list", [])
+        successful_names = state.get("successful_names", [])
+        summary_data = state.get("summary_data", [])
+        best_estimators = state.get("best_estimators", {})
+        vprint(f"-> Successfully loaded {len(successful_names)} previously trained models: {successful_names}")
+    else:
+        results_score = []
+        test_scores_list = []
+        successful_names = []
+        summary_data = []
+        best_estimators = {}
+
+    # ==============================================================================
     # PHASE 2: FULL EVALUATION AND TUNING
     # ==============================================================================
-    results_score = []
-    test_scores_list = []
-    successful_names = []
-    summary_data = []
-    best_estimators = {}
-
     for name, model in models.items():
+        
+        # --- NEW: The Skip Logic ---
+        if name in successful_names:
+            vprint(f"\n⏭️ Skipping [{name}] (Already completed in checkpoint file).")
+            continue
+
         start_time = time.time()
 
         vprint("\n" + "=" * 70)
@@ -406,10 +474,16 @@ def evaluate_and_plot_models(
                 f_kwargs.setdefault("model__eval_set", [(X_val, y_val)])
 
             if param_grids is not None and name in param_grids:
-                search_cls = GridSearchCV if search_type.lower() == "grid" else RandomizedSearchCV
-                kwargs = {"cv": cv_splitter, "scoring": primary_metric, "n_jobs": -1}
-                if search_type.lower() != "grid":
-                    kwargs.update({"n_iter": 10, "random_state": random_seed})
+                search_type_lower = search_type.lower()
+                if search_type_lower == "grid":
+                    search_cls = GridSearchCV
+                    kwargs = {"cv": cv_splitter, "scoring": primary_metric, "n_jobs": -1}
+                elif search_type_lower == "halving":
+                    search_cls = HalvingGridSearchCV
+                    kwargs = {"cv": cv_splitter, "scoring": primary_metric, "n_jobs": -1, "random_state": random_seed}
+                else:  # "random"
+                    search_cls = RandomizedSearchCV
+                    kwargs = {"cv": cv_splitter, "scoring": primary_metric, "n_jobs": -1, "n_iter": 10, "random_state": random_seed}
 
                 vprint(
                     f"[{name}] Running {search_cls.__name__} optimizing for '{primary_metric}'..."
@@ -497,20 +571,109 @@ def evaluate_and_plot_models(
             y_val_pred = pipeline.predict(X_test)
 
             if task_type == "classification":
-                metric1 = accuracy_score(y_test, y_val_pred)
-                metric2 = f1_score(y_test, y_val_pred, average="macro", zero_division=0)
-                vprint(f"\nClassification Report for {name}:")
+                # --- NEW: Comprehensive Classification Metrics ---
+                # Core Scalar Metrics
+                accuracy = accuracy_score(y_test, y_val_pred)
+                precision = precision_score(y_test, y_val_pred, average="macro", zero_division=0)
+                recall = recall_score(y_test, y_val_pred, average="macro", zero_division=0)
+                f1 = f1_score(y_test, y_val_pred, average="macro", zero_division=0)
+                
+                # Specialized Metrics
+                mcc = matthews_corrcoef(y_test, y_val_pred)
+                kappa = cohen_kappa_score(y_test, y_val_pred)
+                
+                # Probabilistic Metrics (requires predicted probabilities)
+                try:
+                    y_proba = pipeline.predict_proba(X_test)
+                    logloss = log_loss(y_test, y_proba)
+                    
+                    # Threshold-Agnostic Metrics (binary classification)
+                    if y_proba.shape[1] == 2:
+                        roc_auc = roc_auc_score(y_test, y_proba[:, 1])
+                    else:
+                        roc_auc = roc_auc_score(y_test, y_proba, multi_class="ovr", average="macro")
+                except Exception:
+                    y_proba = None
+                    logloss = None
+                    roc_auc = None
+                
+                # Display metrics
+                metric1 = accuracy
+                metric2 = f1
+                
+                vprint(f"\n{'='*70}")
+                vprint(f"Classification Metrics for {name}:")
+                vprint(f"{'='*70}")
+                vprint(f"Core Scalar Metrics:")
+                vprint(f"  • Accuracy:  {accuracy:.4f}")
+                vprint(f"  • Precision: {precision:.4f}")
+                vprint(f"  • Recall:    {recall:.4f}")
+                vprint(f"  • F1-Score:  {f1:.4f}")
+                vprint(f"Specialized Metrics:")
+                vprint(f"  • MCC (Matthews Correlation Coefficient): {mcc:.4f}")
+                vprint(f"  • Cohen's Kappa: {kappa:.4f}")
+                if logloss is not None:
+                    vprint(f"Probabilistic Metrics:")
+                    vprint(f"  • Log-Loss: {logloss:.4f}")
+                if roc_auc is not None:
+                    vprint(f"Threshold-Agnostic Metrics:")
+                    vprint(f"  • ROC-AUC: {roc_auc:.4f}")
+                vprint(f"{'='*70}")
+                
+                vprint(f"\nDetailed Classification Report for {name}:")
                 vprint(
                     classification_report(
                         y_test, y_val_pred, target_names=target_names, zero_division=0
                     )
                 )
             else:
-                metric1 = r2_score(y_test, y_val_pred)
-                metric2 = np.sqrt(mean_squared_error(y_test, y_val_pred))
+                # --- NEW: Comprehensive Regression Metrics ---
+                # Error/Scale Metrics
                 mae = mean_absolute_error(y_test, y_val_pred)
-                vprint(f"\nRegression Report for {name}:")
-                vprint(f"R² Score: {metric1:.4f} | RMSE: {metric2:.4f} | MAE: {mae:.4f}")
+                mse = mean_squared_error(y_test, y_val_pred)
+                rmse = np.sqrt(mse)
+                
+                # Percentage Metrics
+                try:
+                    mape = mean_absolute_percentage_error(y_test, y_val_pred)
+                except Exception:
+                    mape = None
+                
+                # Goodness-of-Fit Metrics
+                r2 = r2_score(y_test, y_val_pred)
+                
+                # Adjusted R² (accounts for number of features)
+                n_samples = y_test.shape[0]
+                n_features = X_test.shape[1]
+                adj_r2 = 1 - (1 - r2) * (n_samples - 1) / (n_samples - n_features - 1) if n_samples > n_features else r2
+                
+                # Logarithmic Metrics
+                try:
+                    rmsle = np.sqrt(mean_squared_log_error(y_test, y_val_pred))
+                except Exception:
+                    rmsle = None
+                
+                # Display metrics
+                metric1 = r2
+                metric2 = rmse
+                
+                vprint(f"\n{'='*70}")
+                vprint(f"Regression Metrics for {name}:")
+                vprint(f"{'='*70}")
+                vprint(f"Error/Scale Metrics:")
+                vprint(f"  • MAE (Mean Absolute Error):        {mae:.4f}")
+                vprint(f"  • MSE (Mean Squared Error):         {mse:.4f}")
+                vprint(f"  • RMSE (Root Mean Squared Error):   {rmse:.4f}")
+                if mape is not None:
+                    vprint(f"Percentage Metrics:")
+                    vprint(f"  • MAPE (Mean Absolute % Error):     {mape:.4f}")
+                vprint(f"Goodness-of-Fit Metrics:")
+                vprint(f"  • R² Score:                         {r2:.4f}")
+                vprint(f"  • Adjusted R²:                      {adj_r2:.4f}")
+                if rmsle is not None:
+                    vprint(f"Logarithmic Metrics:")
+                    vprint(f"  • RMSLE (Root Mean Squared Log Error): {rmsle:.4f}")
+                vprint(f"{'='*70}")
 
             test_scores_list.append(metric1)
 
@@ -534,9 +697,9 @@ def evaluate_and_plot_models(
                     ax.plot(
                         [min_val, max_val], [min_val, max_val], "r--", lw=2, label="Ideal Fit (y=x)"
                     )
-                    ax.set_xlabel("Actual Values")
-                    ax.set_ylabel("Predicted Values")
-                    ax.set_title(f"Predicted vs. Actual: {name}")
+                    ax.set_xlabel("Actual Values", fontsize=11)
+                    ax.set_ylabel("Predicted Values", fontsize=11)
+                    ax.set_title(f"Predicted vs. Actual: {name}", fontsize=12, fontweight="bold")
                     ax.legend()
                     ax.grid(True, linestyle="--", alpha=0.6)
 
@@ -544,6 +707,109 @@ def evaluate_and_plot_models(
                 if verbose:
                     plt.show()
                 plt.close(fig)
+                
+                # --- NEW: Advanced Regression Visualizations ---
+                if task_type == "regression":
+                    try:
+                        # Residuals and Distribution
+                        residuals = y_test - y_val_pred
+                        
+                        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+                        
+                        # 1. Residuals vs Predicted Values (Homoscedasticity check)
+                        axes[0, 0].scatter(y_val_pred, residuals, alpha=0.6, color="steelblue", edgecolor="k")
+                        axes[0, 0].axhline(y=0, color="r", linestyle="--", lw=2)
+                        axes[0, 0].set_xlabel("Predicted Values", fontsize=11)
+                        axes[0, 0].set_ylabel("Residuals", fontsize=11)
+                        axes[0, 0].set_title("Residuals vs Predicted (Homoscedasticity)", fontsize=12, fontweight="bold")
+                        axes[0, 0].grid(True, alpha=0.3)
+                        
+                        # 2. Residuals Distribution (Normality check)
+                        axes[0, 1].hist(residuals, bins=30, color="teal", alpha=0.7, edgecolor="black")
+                        axes[0, 1].axvline(x=0, color="r", linestyle="--", lw=2)
+                        axes[0, 1].set_xlabel("Residuals", fontsize=11)
+                        axes[0, 1].set_ylabel("Frequency", fontsize=11)
+                        axes[0, 1].set_title("Residuals Distribution", fontsize=12, fontweight="bold")
+                        axes[0, 1].grid(True, alpha=0.3, axis="y")
+                        
+                        # 3. Q-Q Plot (Normality check)
+                        from scipy import stats
+                        stats.probplot(residuals, dist="norm", plot=axes[1, 0])
+                        axes[1, 0].set_title("Q-Q Plot (Normality Check)", fontsize=12, fontweight="bold")
+                        axes[1, 0].grid(True, alpha=0.3)
+                        
+                        # 4. Scale-Location Plot (Sqrt of standardized residuals vs fitted)
+                        standardized_residuals = residuals / np.std(residuals)
+                        axes[1, 1].scatter(y_val_pred, np.sqrt(np.abs(standardized_residuals)), 
+                                         alpha=0.6, color="darkgreen", edgecolor="k")
+                        axes[1, 1].set_xlabel("Predicted Values", fontsize=11)
+                        axes[1, 1].set_ylabel("√|Standardized Residuals|", fontsize=11)
+                        axes[1, 1].set_title("Scale-Location Plot", fontsize=12, fontweight="bold")
+                        axes[1, 1].grid(True, alpha=0.3)
+                        
+                        plt.tight_layout()
+                        if verbose:
+                            plt.show()
+                        plt.close(fig)
+                    except Exception as e:
+                        vprint(f"⚠️ Could not generate regression diagnostics for {name}: {str(e)}")
+                
+                # --- NEW: ROC & PR Curves for Classification ---
+                if task_type == "classification" and y_proba is not None:
+                    # ROC Curve
+                    try:
+                        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+                        
+                        # Binary classification ROC curve
+                        if y_proba.shape[1] == 2:
+                            fpr, tpr, _ = roc_curve(y_test, y_proba[:, 1])
+                            roc_auc_val = auc(fpr, tpr)
+                            ax1.plot(fpr, tpr, color="steelblue", lw=2.5, 
+                                    label=f"ROC curve (AUC = {roc_auc_val:.3f})")
+                        else:
+                            # Multi-class: One-vs-Rest
+                            colors = plt.cm.Set1(np.linspace(0, 1, y_proba.shape[1]))
+                            for i in range(y_proba.shape[1]):
+                                fpr, tpr, _ = roc_curve((y_test == i).astype(int), y_proba[:, i])
+                                roc_auc_val = auc(fpr, tpr)
+                                ax1.plot(fpr, tpr, color=colors[i], lw=2, 
+                                        label=f"Class {i} (AUC = {roc_auc_val:.3f})")
+                        
+                        ax1.plot([0, 1], [0, 1], "k--", lw=1, label="Chance")
+                        ax1.set_xlabel("False Positive Rate", fontsize=11)
+                        ax1.set_ylabel("True Positive Rate", fontsize=11)
+                        ax1.set_title(f"ROC Curve: {name}", fontsize=12, fontweight="bold")
+                        ax1.legend(loc="lower right")
+                        ax1.grid(True, alpha=0.3)
+                        
+                        # Precision-Recall Curve
+                        if y_proba.shape[1] == 2:
+                            precision_vals, recall_vals, _ = precision_recall_curve(y_test, y_proba[:, 1])
+                            pr_auc = auc(recall_vals, precision_vals)
+                            ax2.plot(recall_vals, precision_vals, color="darkgreen", lw=2.5,
+                                    label=f"PR curve (AUC = {pr_auc:.3f})")
+                        else:
+                            # Multi-class: One-vs-Rest
+                            for i in range(y_proba.shape[1]):
+                                precision_vals, recall_vals, _ = precision_recall_curve(
+                                    (y_test == i).astype(int), y_proba[:, i]
+                                )
+                                pr_auc = auc(recall_vals, precision_vals)
+                                ax2.plot(recall_vals, precision_vals, color=colors[i], lw=2,
+                                        label=f"Class {i} (AUC = {pr_auc:.3f})")
+                        
+                        ax2.set_xlabel("Recall", fontsize=11)
+                        ax2.set_ylabel("Precision", fontsize=11)
+                        ax2.set_title(f"Precision-Recall Curve: {name}", fontsize=12, fontweight="bold")
+                        ax2.legend(loc="best")
+                        ax2.grid(True, alpha=0.3)
+                        
+                        plt.tight_layout()
+                        if verbose:
+                            plt.show()
+                        plt.close(fig)
+                    except Exception as e:
+                        vprint(f"⚠️ Could not generate ROC/PR curves for {name}: {str(e)}")
 
             elapsed_time = time.time() - start_time
 
@@ -557,70 +823,21 @@ def evaluate_and_plot_models(
                     "Best Params": best_params_display,
                 }
             )
-
-            if plot_importance:
-                fitted_model = pipeline.named_steps["model"]
-                importances_array = None
-
-                if hasattr(fitted_model, "coef_"):
-                    coefs = np.abs(fitted_model.coef_)
-                    if coefs.ndim > 1:
-                        coefs = np.mean(coefs, axis=0)
-                    else:
-                        coefs = coefs.flatten()
-                    importances_array = coefs
-                elif hasattr(fitted_model, "feature_importances_"):
-                    importances_array = fitted_model.feature_importances_
-
-                if importances_array is not None:
-                    current_names = list(feature_names) if feature_names else []
-
-                    # Try to extract feature names from pipeline steps
-                    # Handle both 'preprocessor' key and direct pipeline steps
-                    preprocessor = pipeline.named_steps.get("preprocessor")
-                    if preprocessor is None:
-                        # If no preprocessor key, search for any step with get_feature_names_out
-                        for step_name, step in pipeline.named_steps.items():
-                            if (
-                                step_name != "model"
-                                and step_name != "sampler"
-                                and hasattr(step, "get_feature_names_out")
-                            ):
-                                preprocessor = step
-                                break
-
-                    if preprocessor and hasattr(preprocessor, "get_feature_names_out"):
-                        try:
-                            current_names = list(preprocessor.get_feature_names_out(feature_names))
-                        except Exception:
-                            pass
-
-                    actual_n = len(importances_array)
-                    if len(current_names) < actual_n:
-                        missing = actual_n - len(current_names)
-                        # Try to identify engineered features from step names
-                        for i in range(missing):
-                            current_names.append(f"Feature_{i+1}")
-                    elif len(current_names) > actual_n:
-                        current_names = current_names[:actual_n]
-
-                    n_feats = min(len(importances_array), top_n_features)
-                    top_indices = np.argsort(importances_array)[-n_feats:]
-                    top_vals = importances_array[top_indices]
-                    top_names = np.array(current_names)[top_indices]
-
-                    fig = plt.figure(figsize=(8, 5))
-                    color = "steelblue" if hasattr(fitted_model, "coef_") else "teal"
-                    title_type = "Coefficients" if hasattr(fitted_model, "coef_") else "Importances"
-
-                    plt.barh(top_names, top_vals, color=color)
-                    plt.title(f"Top {n_feats} Feature {title_type}: {name}")
-                    plt.xlabel("Importance / Impact")
-                    plt.axvline(0, color="black", lw=1)
-                    plt.tight_layout()
-                    if verbose:
-                        plt.show()
-                    plt.close(fig)
+            
+            # --- NEW: INCREMENTAL STATE SAVING ---
+            # Automatically save the progress after every successfully completed model
+            if checkpoint_file:
+                joblib.dump(
+                    {
+                        "results_score": results_score,
+                        "test_scores_list": test_scores_list,
+                        "successful_names": successful_names,
+                        "summary_data": summary_data,
+                        "best_estimators": best_estimators,
+                    },
+                    checkpoint_file,
+                )
+                vprint(f"💾 Checkpoint updated: State saved successfully.")
 
         except Exception:
             vprint(f"\n[ERROR] Model '{name}' failed during evaluation!")
@@ -722,7 +939,6 @@ def evaluate_and_plot_models(
         "best_models": best_estimators,
         "raw_cv_scores": dict(zip(successful_names, results_score)),
         "ultimate_winner": ultimate_winner,
-        # --- NEW: Return the raw splits for advanced users ---
         "data_splits": {
             "X_train": X_train,
             "y_train": y_train,
