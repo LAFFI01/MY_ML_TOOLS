@@ -7,7 +7,7 @@ Get started with ML Toolkit in 5 minutes!
 ## 1️⃣ Installation (30 seconds)
 
 ```bash
-pip install git+https://github.com/YOUR_USERNAME/MY_ML.git
+pip install git+https://github.com/LAFFI01/MY_ML_TOOLS.git
 ```
 
 ---

@@ -10,24 +10,24 @@ Quick and comprehensive guide to install and start using **ML Toolkit**.
 
 ```bash
 # Basic installation
-pip install git+https://github.com/YOUR_USERNAME/MY_ML.git
+pip install git+https://github.com/LAFFI01/MY_ML_TOOLS.git
 
 # With development tools
-pip install git+https://github.com/YOUR_USERNAME/MY_ML.git[dev]
+pip install git+https://github.com/LAFFI01/MY_ML_TOOLS.git[dev]
 
 # With documentation tools
-pip install git+https://github.com/YOUR_USERNAME/MY_ML.git[docs]
+pip install git+https://github.com/LAFFI01/MY_ML_TOOLS.git[docs]
 
 # With everything
-pip install git+https://github.com/YOUR_USERNAME/MY_ML.git[dev,docs]
+pip install git+https://github.com/LAFFI01/MY_ML_TOOLS.git[dev,docs]
 ```
 
 ### **Method 2: Clone & Install Locally**
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/MY_ML.git
-cd MY_ML
+git clone https://github.com/LAFFI01/MY_ML_TOOLS.git
+cd MY_ML_TOOLS
 
 # Install in development mode (editable)
 pip install -e .
@@ -73,13 +73,13 @@ When you install the package, these libraries are **automatically installed**:
 
 **Development Tools:**
 ```bash
-pip install git+https://github.com/YOUR_USERNAME/MY_ML.git[dev]
+pip install git+https://github.com/LAFFI01/MY_ML_TOOLS.git[dev]
 ```
 Includes: pytest, black, flake8, mypy, isort, pre-commit, build, twine
 
 **Documentation:** 
 ```bash
-pip install git+https://github.com/YOUR_USERNAME/MY_ML.git[docs]
+pip install git+https://github.com/LAFFI01/MY_ML_TOOLS.git[docs]
 ```
 Includes: sphinx, sphinx-rtd-theme
 
