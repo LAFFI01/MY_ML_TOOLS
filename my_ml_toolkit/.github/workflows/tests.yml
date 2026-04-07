@@ -1,0 +1,55 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip setuptools wheel
+        pip install -e .[dev]
+
+    - name: Lint with flake8
+      run: |
+        flake8 my_ml_toolkit tests --max-line-length=100 --extend-ignore=E203,W503
+
+    - name: Type check with mypy
+      run: |
+        mypy my_ml_toolkit --ignore-missing-imports
+
+    - name: Format check with black
+      run: |
+        black --check --line-length=100 my_ml_toolkit tests
+
+    - name: Import sort check with isort
+      run: |
+        isort --check-only --profile=black --line-length=100 my_ml_toolkit tests
+
+    - name: Test with pytest
+      run: |
+        pytest tests/ -v --cov=my_ml_toolkit --cov-report=xml --cov-report=term-missing
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        files: ./coverage.xml
+        fail_ci_if_error: false
