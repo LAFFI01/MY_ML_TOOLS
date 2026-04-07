@@ -4,7 +4,38 @@ Collection of practical examples showing how to use ML Toolkit.
 
 ---
 
-## 📝 Available Examples
+## � Prerequisites
+
+Before running these examples, you need to install the ML Toolkit package.
+
+### Installation Methods
+
+**See [INSTALL.md](../INSTALL.md) for detailed installation instructions.**
+
+#### Quick Install (Recommended)
+
+```bash
+# From GitHub
+pip install git+https://github.com/LAFFI01/MY_ML_TOOLS.git
+
+# With dev dependencies (for development)
+pip install "git+https://github.com/LAFFI01/MY_ML_TOOLS.git#egg=my_ml_toolkit[dev]"
+
+# From local source
+pip install -e .
+```
+
+#### Verify Installation
+
+```bash
+python -c "from my_ml_toolkit import evaluate_and_plot_models; print('✓ Installation successful!')"
+```
+
+If this works, you're ready to run the examples! ✅
+
+---
+
+## �📝 Available Examples
 
 ### Example 1: Basic Classification
 **File**: `example1_basic_classification.py`
@@ -79,6 +110,15 @@ python examples/example4_real_dataset.py
 ---
 
 ## 🚀 Quick Start
+
+### Prerequisites Check
+
+Before running examples, ensure:
+1. ✅ ML Toolkit is installed (see [INSTALL.md](../INSTALL.md))
+2. ✅ Dependencies are installed (pandas, scikit-learn, matplotlib)
+3. ✅ Python 3.8+ is installed
+
+> 📌 **First time?** Read [QUICKSTART.md](../QUICKSTART.md) for a guided 5-minute walkthrough
 
 ### Run All Examples
 
@@ -230,12 +270,22 @@ results = evaluate_and_plot_models(
 
 ---
 
-## 📖 Related Documentation
+## 🎯 What's Next?
 
-- [QUICKSTART.md](../QUICKSTART.md) - 5-minute guide
-- [API_REFERENCE.md](../API_REFERENCE.md) - Complete API docs
-- [INSTALL.md](../INSTALL.md) - Installation guide
-- [FAQ.md](../FAQ.md) - Common questions
+After running these examples:
+
+1. **Review the API** → See [API_REFERENCE.md](../API_REFERENCE.md) for all available functions
+2. **Read the Manual** → Check [README_MANUAL.md](../README_MANUAL.md) for detailed explanations
+3. **Explore FAQs** → Browse [FAQ.md](../FAQ.md) for common questions
+4. **Check QUICKSTART** → [QUICKSTART.md](../QUICKSTART.md) has more guided examples
+5. **Create Your Own** → Use these examples as templates for your own projects
+
+### Installation Help
+
+If you run into issues:
+- **Import errors?** → See [INSTALL.md](../INSTALL.md#troubleshooting)
+- **Missing dependencies?** → Run: `pip install "git+https://github.com/LAFFI01/MY_ML_TOOLS.git"`
+- **Version issues?** → Check [FAQ.md](../FAQ.md) for compatibility info
 
 ---
 
