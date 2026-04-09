@@ -111,6 +111,91 @@ def _build_pipeline(preprocessor: Optional[Any], sampler: Optional[Any], model: 
     return ImbPipeline(steps)
 
 
+def _build_preprocessor_cache(
+    preprocess_pipeline: Union[Any, Dict[str, Any]],
+    model_names: List[str],
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+) -> Dict[int, Any]:
+    """
+    Build and cache fitted preprocessors to avoid redundant refitting.
+    
+    This function:
+    1. Identifies unique preprocessors by object identity
+    2. Fits each unique preprocessor only ONCE
+    3. Returns a cache mapping object_id -> fitted_preprocessor
+    
+    Args:
+        preprocess_pipeline: Single or dict of preprocessor pipelines
+        model_names: List of model names to check for unique preprocessors
+        X_train: Training features
+        y_train: Training target
+        
+    Returns:
+        Dict mapping preprocessor object id -> fitted preprocessor instance
+    """
+    cache = {}
+    
+    # Get all unique preprocessors
+    preprocessors_to_fit = {}
+    for model_name in model_names:
+        preproc = _get_preprocessor(preprocess_pipeline, model_name)
+        obj_id = id(preproc)
+        if obj_id not in preprocessors_to_fit and preproc is not None:
+            preprocessors_to_fit[obj_id] = preproc
+    
+    # Fit each unique preprocessor once
+    for obj_id, preproc in preprocessors_to_fit.items():
+        fitted = preproc.fit(X_train, y_train)
+        cache[obj_id] = fitted
+    
+    return cache
+
+
+def _build_pipeline_from_cache(
+    preprocessor: Optional[Any],
+    sampler: Optional[Any],
+    model: Any,
+    fitted_preprocessor_cache: Dict[int, Any],
+) -> ImbPipeline:
+    """
+    Build a pipeline using a FITTED preprocessor from cache, not a fresh one.
+    
+    This replaces _build_pipeline() when you have a cache of fitted preprocessors.
+    
+    Args:
+        preprocessor: Original (potentially unfitted) preprocessor object
+        sampler: Imbalanced data sampler (e.g., SMOTE)
+        model: The ML model to add to pipeline
+        fitted_preprocessor_cache: Cache mapping object_id -> fitted_preprocessor
+        
+    Returns:
+        ImbPipeline with fitted preprocessor steps + sampler + model
+    """
+    steps = []
+    
+    if preprocessor is not None:
+        obj_id = id(preprocessor)
+        if obj_id in fitted_preprocessor_cache:
+            fitted_preproc = fitted_preprocessor_cache[obj_id]
+            if hasattr(fitted_preproc, "steps"):
+                steps.extend(fitted_preproc.steps.copy())
+            else:
+                steps.append(("preprocessor", fitted_preproc))
+        else:
+            # Fallback to unfitted preprocessor if not in cache
+            if hasattr(preprocessor, "steps"):
+                steps.extend(preprocessor.steps.copy())
+            else:
+                steps.append(("preprocessor", preprocessor))
+    
+    if sampler is not None:
+        steps.append(("sampler", sampler))
+    
+    steps.append(("model", model))
+    return ImbPipeline(steps)
+
+
 def _extract_feature_importance(
     pipeline: Any, feature_names: Optional[List[str]] = None, top_k: int = 10
 ) -> Dict[str, float]:
@@ -359,6 +444,17 @@ def evaluate_and_plot_models(
         vprint(f"Data Shapes -> Train: {X_train.shape}, Test: {X_test.shape}")
 
     # ==============================================================================
+    # 🚀 NEW: BUILD PREPROCESSOR CACHE (Fit each unique preprocessor once)
+    # ==============================================================================
+    vprint("\n" + "=" * 70)
+    vprint("🔧 Building Preprocessor Cache (fitting each unique preprocessor ONCE)")
+    vprint("=" * 70)
+    fitted_preprocessor_cache = _build_preprocessor_cache(
+        preprocess_pipeline, list(models.keys()), X_train, y_train
+    )
+    vprint(f"✓ Cache built: {len(fitted_preprocessor_cache)} unique preprocessor(s) fitted")
+
+    # ==============================================================================
     # PHASE 1: QUICK SCREENING
     # ==============================================================================
     if top_k is not None and top_k < len(models):
@@ -380,7 +476,9 @@ def evaluate_and_plot_models(
         screening_scores = {}
         for name, model in models.items():
             current_preprocessor = _get_preprocessor(preprocess_pipeline, name)
-            base_pipeline = _build_pipeline(current_preprocessor, sampler, model)
+            base_pipeline = _build_pipeline_from_cache(
+                current_preprocessor, sampler, model, fitted_preprocessor_cache
+            )
             f_kwargs = fit_params.get(name, {}) if fit_params else {}
 
             try:
@@ -455,7 +553,9 @@ def evaluate_and_plot_models(
 
         try:
             current_preprocessor = _get_preprocessor(preprocess_pipeline, name)
-            base_pipeline = _build_pipeline(current_preprocessor, sampler, model)
+            base_pipeline = _build_pipeline_from_cache(
+                current_preprocessor, sampler, model, fitted_preprocessor_cache
+            )
 
             best_params_display = "Default"
             pipeline = base_pipeline
