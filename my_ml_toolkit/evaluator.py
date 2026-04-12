@@ -24,6 +24,7 @@ from sklearn.metrics import (
     cohen_kappa_score,
     f1_score,
     log_loss,
+    make_scorer,
     matthews_corrcoef,
     mean_absolute_error,
     mean_absolute_percentage_error,
@@ -48,10 +49,61 @@ from sklearn.model_selection import (
     learning_curve,
     train_test_split,
 )
+from sklearn.metrics import make_scorer
+
+# ==============================================================================
+# CUSTOM METRICS FOR IMBALANCED CLASSIFICATION
+# ==============================================================================
+
+
+def balanced_multiclass_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Balanced/macro-averaged accuracy for multi-class classification.
+    
+    Calculates per-class recall and averages them, making it robust to class imbalance.
+    Each class is weighted equally regardless of sample count.
+    
+    Formula: Accuracy = (1/C) * Σ(TP_i / All_samples_of_class_i)
+    
+    Args:
+        y_true: True labels
+        y_pred: Predicted labels
+        
+    Returns:
+        Balanced accuracy score (0 to 1)
+        
+    Example:
+        >>> y_true = [0, 1, 2, 0, 1, 2]
+        >>> y_pred = [0, 1, 1, 0, 1, 2]
+        >>> balanced_multiclass_accuracy(y_true, y_pred)
+        # Returns average of recall for each class
+    """
+    unique_classes = np.unique(y_true)
+    recalls = []
+    
+    for cls in unique_classes:
+        class_mask = y_true == cls
+        if np.sum(class_mask) > 0:
+            recall = np.sum((y_true == cls) & (y_pred == cls)) / np.sum(class_mask)
+            recalls.append(recall)
+    
+    return float(np.mean(recalls)) if recalls else 0.0
+
+
+def get_balanced_accuracy_scorer():
+    """
+    Create a sklearn scorer for balanced multiclass accuracy.
+    
+    Returns:
+        Scorer object compatible with GridSearchCV, cross_val_score, etc.
+    """
+    return make_scorer(balanced_multiclass_accuracy)
+
 
 # ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
+
 
 
 def _validate_inputs(X: pd.DataFrame, y: pd.Series, test_size: float, val_size: float) -> None:
@@ -329,7 +381,8 @@ def evaluate_and_plot_models(
         cv: Number of cross-validation folds. Default: 4.
         search_type: Hyperparameter search method: "grid", "random", or "halving". 
             "halving" uses successive halving for efficient large-scale tuning. Default: "grid".
-        primary_metric: Metric to optimize ("accuracy", "f1", "r2", etc.). 
+        primary_metric: Metric to optimize ("accuracy", "f1", "r2", "balanced_accuracy", etc.). 
+            Use "balanced_accuracy" for imbalanced classification tasks. 
             Auto-selected if None. Default: None.
         top_k: Filter to top-k models after quick screening phase. 
             If None, all models evaluated. Default: None.
@@ -392,6 +445,9 @@ def evaluate_and_plot_models(
         cv_splitter = StratifiedKFold(n_splits=cv, shuffle=True, random_state=random_seed)
         if primary_metric is None:
             primary_metric = "accuracy"
+        # Convert balanced_accuracy string to scorer object
+        if primary_metric == "balanced_accuracy":
+            primary_metric = get_balanced_accuracy_scorer()
     else:
         cv_splitter = KFold(n_splits=cv, shuffle=True, random_state=random_seed)
         if primary_metric is None:

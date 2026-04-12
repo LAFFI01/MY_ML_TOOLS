@@ -35,7 +35,8 @@ Crucially, it uses `imblearn.pipeline` under the hood, guaranteeing that samplin
 ## ✨ Key Features
 
 - 🧠 **Dynamic Task Routing:** Automatically detects task type and swaps evaluation metrics, cross-validation splitters (`StratifiedKFold` vs `KFold`), and charts.
-- 🚀 **Two-Phase Evaluation:** Optional `top_k` screening feature tests models on a fraction of data to eliminate poor performers before heavy Grid Search tuning begins.
+- � **Balanced Accuracy for Imbalanced Classification:** Built-in support for macro-averaged per-class recall metric that treats all classes equally—ideal for imbalanced datasets.
+- �🚀 **Two-Phase Evaluation:** Optional `top_k` screening feature tests models on a fraction of data to eliminate poor performers before heavy Grid Search tuning begins.
 - 🔀 **Dynamic Preprocessing:** Pass a single pipeline for all models, or a dictionary mapping specific preprocessors to specific models (e.g., standard scaling for Logistic Regression, but no scaling for Random Forest).
 - ⚖️ **Imbalanced Data Safety:** Seamless integration with SMOTE and RandomOverSampler with strict anti-data-leakage architecture.
 - 📊 **Comprehensive Visuals:** Auto-generates Learning Curves, Confusion Matrices, Scatter Plots, Feature Importances, and cross-validation Box Plots.

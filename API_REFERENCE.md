@@ -4,6 +4,60 @@ Complete reference for ML Toolkit functions and parameters.
 
 ---
 
+## 📌 Metrics & Scoring Functions
+
+### `balanced_multiclass_accuracy(y_true, y_pred) → float`
+
+Balanced accuracy for multi-class classification (macro-averaged per-class recall).
+
+**Why use this?** Standard accuracy can be misleading with imbalanced classes. This metric treats all classes equally.
+
+**Formula:**
+```
+Accuracy = (1/C) × Σ(TP_i / All_samples_of_class_i)
+```
+
+**Parameters:**
+- `y_true`: True labels (numpy array or pandas Series)
+- `y_pred`: Predicted labels (numpy array or pandas Series)
+
+**Returns:** Float between 0 and 1
+
+**Example:**
+```python
+from my_ml_toolkit import balanced_multiclass_accuracy
+import numpy as np
+
+y_true = np.array([0, 1, 2, 0, 1, 2])
+y_pred = np.array([0, 1, 1, 0, 1, 2])
+
+score = balanced_multiclass_accuracy(y_true, y_pred)
+print(f"Balanced Accuracy: {score:.4f}")  # Output: 0.7222
+```
+
+---
+
+### `get_balanced_accuracy_scorer() → Scorer`
+
+Create a scikit-learn compatible scorer for `balanced_multiclass_accuracy`.
+
+**Returns:** `_Scorer` object compatible with `GridSearchCV`, `cross_val_score`, etc.
+
+**Example:**
+```python
+from my_ml_toolkit import get_balanced_accuracy_scorer
+from sklearn.model_selection import cross_val_score
+from sklearn.ensemble import RandomForestClassifier
+
+scorer = get_balanced_accuracy_scorer()
+rf = RandomForestClassifier()
+
+scores = cross_val_score(rf, X, y, cv=5, scoring=scorer)
+print(f"Mean CV Score: {scores.mean():.4f}")
+```
+
+---
+
 ## 📌 Main Function: `evaluate_and_plot_models`
 
 Enterprise machine learning evaluation pipeline for both classification and regression tasks.
@@ -256,12 +310,29 @@ def evaluate_and_plot_models(
 ### **Evaluation & Ranking Parameters**
 
 #### `primary_metric`
-- **Type**: `Optional[str]`
-- **Default**: `None` (auto-selected)
-- **Classification**: `"accuracy"`, `"precision"`, `"recall"`, `"f1"`, `"auc"`, `"kappa"`, `"log_loss"`
+- **Type**: `Optional[str]` or `_Scorer`
+- **Default**: `None` (auto-selected: "accuracy" for classification, "r2" for regression)
+- **Classification**: `"accuracy"`, `"precision"`, `"recall"`, `"f1"`, `"auc"`, `"kappa"`, `"log_loss"`, **`"balanced_accuracy"`**
 - **Regression**: `"r2"`, `"mae"`, `"mse"`, `"rmse"`, `"mape"`, `"msle"`
-- **Description**: Main metric for model ranking
-- **Example**: `primary_metric="f1"`
+- **Description**: Main metric for model ranking and hyperparameter tuning
+- **When to use `"balanced_accuracy"`:** Use this for **imbalanced classification tasks** where classes have unequal sample counts. It calculates macro-averaged per-class recall, treating all classes equally regardless of their frequency.
+- **Example - Imbalanced Data**:
+  ```python
+  # For imbalanced classification (e.g., fraud detection)
+  results = evaluate_and_plot_models(
+      models=models,
+      preprocess_pipeline=preprocess,
+      X=X, y=y,
+      task_type="classification",
+      primary_metric="balanced_accuracy",  # ← Use this for imbalance!
+      cv=5
+  )
+  ```
+- **Example - Balanced Data**:
+  ```python
+  # For well-balanced classification
+  primary_metric="f1"  # Good general-purpose metric
+  ```
 
 #### `top_k`
 - **Type**: `Optional[int]`
