@@ -64,33 +64,40 @@ The toolkit automatically installs the following locked versions to guarantee st
 
 ```python
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from my_ml_toolkit.evaluator import evaluate_and_plot_models
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from my_ml_toolkit import evaluate_and_plot_models
 
-# 1. Load and split data
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+# 1. Load your data
+X = pd.read_csv('features.csv')
+y = pd.read_csv('target.csv').squeeze()
 
 # 2. Define models
 models = {
     'Random Forest': RandomForestClassifier(random_state=42),
-    'Logistic Reg': LogisticRegression()
+    'Logistic Regression': LogisticRegression(max_iter=1000)
 }
 
-# 3. Run evaluation
+# 3. Define preprocessing (optional)
+preprocess_pipeline = Pipeline([('scaler', StandardScaler())])
+
+# 4. Run evaluation
 results = evaluate_and_plot_models(
     models=models,
-    preprocess_pipeline=None, # Pass your sklearn Pipeline here
-    X_train=X_train, y_train=y_train,
-    X_test=X_test, y_test=y_test,
+    preprocess_pipeline=preprocess_pipeline,
+    X=X,
+    y=y,
+    test_size=0.2,
     task_type='classification',
-    cv=5
+    cv=5,
+    verbose=True,
 )
 
-# 4. Access the best model
-best_model = results['ultimate_winner']
+# 5. Access results
 print(results['summary_df'])
+best_model = results['ultimate_winner']
 ```
 
 ---
@@ -101,22 +108,34 @@ print(results['summary_df'])
 
 ```python
 from imblearn.over_sampling import SMOTE
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 
+# Define preprocessing
+preprocess_pipeline = Pipeline([('scaler', StandardScaler())])
+
+# Define hyperparameter grids (grid search will apply to tuned models)
 param_grids = {
-    'Random Forest': {'model__max_depth': [5, 10, 15]}
+    'RandomForest': {
+        'max_depth': [5, 10, 15],
+        'n_estimators': [50, 100]
+    }
 }
 
 results = evaluate_and_plot_models(
     models=models,
-    preprocess_pipeline=my_scaler_pipeline,
-    X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test,
+    preprocess_pipeline=preprocess_pipeline,
+    X=X,
+    y=y,
+    test_size=0.2,
     task_type='classification',
     target_names=['Healthy', 'Sick'],        # Labels for Confusion Matrix
-    feature_names=X_train.columns.tolist(),  # Labels for Importance Plot
+    feature_names=X.columns.tolist(),        # Labels for Importance Plot
     sampler=SMOTE(random_state=42),          # Handles class imbalance
     param_grids=param_grids,                 # Triggers GridSearchCV
     cv=5,
-    primary_metric='f1_macro'
+    primary_metric='f1',
+    verbose=True
 )
 ```
 
@@ -125,32 +144,99 @@ results = evaluate_and_plot_models(
 
 ```python
 from sklearn.linear_model import Ridge
+from sklearn.ensemble import RandomForestRegressor
 
-reg_models = {'Ridge': Ridge()}
+reg_models = {
+    'Ridge': Ridge(),
+    'RandomForest': RandomForestRegressor(random_state=42)
+}
 
 results = evaluate_and_plot_models(
     models=reg_models,
-    preprocess_pipeline=my_scaler_pipeline,
-    X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test,
+    preprocess_pipeline=None,
+    X=X,
+    y=y,
+    test_size=0.2,
     task_type='regression',                  # Triggers regression protocols
-    plot_diagnostics=True                    # Outputs a Predicted vs Actual scatter plot
+    cv=5,
+    plot_diagnostics=True,                   # Outputs Predicted vs Actual scatter plots
+    verbose=True
 )
 ```
 
 ### 3. Per-Model Preprocessing (Dynamic Routing)
-Some models require scaling, others do not. You can pass a dictionary of pipelines to route data preparation specifically to the algorithm that needs it.
+Some models require scaling, others do not. Pass a dictionary of pipelines to route preprocessing specifically to algorithms that need it.
 
 ```python
-pipelines = {
-    'Logistic Regression': StandardScalerPipeline(),
-    'Random Forest': None,  # Trees don't need scaling
-    'default': StandardScalerPipeline() # Fallback for any other model
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+
+# Define per-model preprocessing pipelines
+preprocess_pipelines = {
+    'LogisticRegression': Pipeline([('scaler', StandardScaler())]),
+    'RandomForest': None,  # Trees don't need scaling
+    'default': Pipeline([('scaler', MinMaxScaler())])  # Fallback
+}
+
+models = {
+    'LogisticRegression': LogisticRegression(max_iter=1000),
+    'RandomForest': RandomForestClassifier(random_state=42),
+    'SVM': SVC(kernel='rbf')
 }
 
 results = evaluate_and_plot_models(
     models=models,
-    preprocess_pipeline=pipelines, # Pass the dict!
-    X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test
+    preprocess_pipeline=preprocess_pipelines,  # Pass the dict!
+    X=X,
+    y=y,
+    test_size=0.2,
+    task_type='classification',
+    cv=5
+)
+```
+
+### 4. Hyperparameter Tuning with Multiple Search Types
+
+```python
+# Grid Search for fine-tuning
+results_grid = evaluate_and_plot_models(
+    models=models,
+    preprocess_pipeline=preprocess_pipeline,
+    X=X,
+    y=y,
+    param_grids={
+        'RandomForest': {'max_depth': [5, 10, 15], 'n_estimators': [50, 100]},
+    },
+    search_type='grid',
+    cv=5
+)
+
+# Random Search for large parameter spaces
+results_random = evaluate_and_plot_models(
+    models=models,
+    preprocess_pipeline=preprocess_pipeline,
+    X=X,
+    y=y,
+    param_grids={
+        'RandomForest': {'max_depth': [5, 50], 'n_estimators': [10, 500]},
+    },
+    search_type='random',
+    cv=5
+)
+
+# Halving Search for efficient large-scale tuning
+results_halving = evaluate_and_plot_models(
+    models=models,
+    preprocess_pipeline=preprocess_pipeline,
+    X=X,
+    y=y,
+    param_grids={
+        'RandomForest': {'max_depth': [5, 50], 'n_estimators': [10, 500]},
+    },
+    search_type='halving',
+    cv=5
 )
 ```
 
@@ -158,37 +244,46 @@ results = evaluate_and_plot_models(
 
 ## 📖 API Reference
 
+For comprehensive API documentation, see [API_REFERENCE.md](API_REFERENCE.md).
+
 ### `evaluate_and_plot_models()`
-Returns a dictionary containing the evaluation results and the fully trained pipeline objects.
+Returns a dictionary containing comprehensive evaluation results and trained models.
+
+**Key Parameters:**
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| **`models`** | `Dict` | Required | Dictionary of instantiated models `{'Name': model}` |
-| **`preprocess_pipeline`**| `Union[Any, Dict]` | Required | Scikit-learn Pipeline, or a Dictionary mapping model names to specific pipelines. |
-| **`X_train`, `X_test`** | `DataFrame` | Required | Training and testing features. |
-| **`y_train`, `y_test`** | `Series` | Required | Training and testing targets. |
-| **`task_type`** | `str` | `'classification'`| `'classification'` or `'regression'`. |
-| **`target_names`** | `List[str]` | `None` | Class names for Confusion Matrix labeling. |
-| **`feature_names`** | `List[str]` | `None` | Column names for Feature Importance labeling. |
-| **`param_grids`** | `Dict` | `None` | Hyperparameter grids for tuning. |
-| **`sampler`** | `Any` | `None` | Imbalanced-learn sampler (e.g., SMOTE). |
-| **`cv`** | `int` | `4` | Number of cross-validation folds. |
-| **`top_k`** | `int` | `None` | Runs Phase 1 fast-screening and advances Top K models. |
-| **`save_dir`** | `str` | `None` | Directory path to automatically `.pkl` save the best models. |
+| **`models`** | `Dict[str, Any]` | Required | Dictionary mapping model names to Scikit-Learn estimator instances |
+| **`preprocess_pipeline`**| `Any \| Dict[str, Any]` | Required | Sklearn Pipeline or dict mapping model names to preprocessing pipelines |
+| **`X`, `y`** | `DataFrame, Series` | Required | Feature matrix and target vector for full dataset |
+| **`test_size`** | `float` | `0.2` | Fraction of data reserved for final testing |
+| **`val_size`** | `float` | `0.0` | Fraction of training data for validation (used by boosting models) |
+| **`task_type`** | `str` | `'classification'`| `'classification'` or `'regression'` |
+| **`target_names`** | `List[str]` | `None` | Class names for confusion matrix labeling |
+| **`feature_names`** | `List[str]` | `None` | Feature names for importance plot labeling |
+| **`param_grids`** | `Dict[str, Dict]` | `None` | Hyperparameter grids for GridSearchCV |
+| **`sampler`** | `Any` | `None` | Imbalanced-learn sampler (e.g., SMOTE) |
+| **`cv`** | `int` | `4` | Number of cross-validation folds |
+| **`search_type`** | `str` | `'grid'` | `'grid'`, `'random'`, or `'halving'` |
+| **`top_k`** | `int` | `None` | Quick screening phase: evaluate all models on 20% of data, advance top K |
+| **`save_dir`** | `str` | `None` | Directory to save fitted models as pickle files |
+| **`resume`** | `bool` | `False` | Resume training from checkpoint if it exists |
+| **`verbose`** | `bool` | `True` | Print progress messages |
 
-### Return Output
-The function returns a dictionary with the following keys:
+**Return Output:**
 
-* `'summary_df'`: A ranked, formatted Pandas DataFrame of all model metrics.
-* `'best_models'`: A dictionary of all fully trained `imblearn.pipeline.Pipeline` objects.
-* `'raw_cv_scores'`: The raw numpy arrays of CV scores for statistical testing.
-* `'ultimate_winner'`: The single highest-performing pipeline object.
+The function returns a dictionary with:
+* `'summary_df'`: Ranked DataFrame of all model metrics
+* `'best_models'`: Dict of all trained pipeline objects
+* `'raw_cv_scores'`: Raw numpy arrays of CV scores
+* `'ultimate_winner'`: Best performing pipeline
+* `'data_splits'`: Dict with X_train, y_train, X_val, y_val, X_test, y_test
 
 ---
 
 ## 📊 Visualizations
 
-By default, the toolkit automatically plots four charts (`True/False` toggles available via parameters):
+By default, the toolkit automatically generates four chart types (toggle via parameters):
 
 1. **Learning Curves (`plot_lc`)**: Checks for overfitting/underfitting across dataset sizes.
 2. **Diagnostics (`plot_diagnostics`)**: Generates a Confusion Matrix (Classification) or an Ideal-Fit Scatter Plot (Regression).

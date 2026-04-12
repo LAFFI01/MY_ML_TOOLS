@@ -6,30 +6,41 @@ Complete reference for ML Toolkit functions and parameters.
 
 ## 📌 Main Function: `evaluate_and_plot_models`
 
-Evaluate and compare multiple machine learning models.
+Enterprise machine learning evaluation pipeline for both classification and regression tasks.
 
 ### Signature
 
 ```python
 def evaluate_and_plot_models(
     models: Dict[str, Any],
-    X_train: pd.DataFrame | np.ndarray,
-    y_train: pd.Series | np.ndarray,
-    X_test: pd.DataFrame | np.ndarray,
-    y_test: pd.Series | np.ndarray,
+    preprocess_pipeline: Union[Any, Dict[str, Any]],
+    X: pd.DataFrame,
+    y: pd.Series,
+    test_size: float = 0.2,
+    val_size: float = 0.0,
+    split_method: str = "random",
+    stratify: bool = True,
+    random_seed: int = 42,
     task_type: str = "classification",
-    primary_metric: str = "accuracy",
-    cv_folds: int = 5,
-    test_size: float = None,
-    verbose: bool = True,
+    target_names: Optional[List[str]] = None,
+    feature_names: Optional[List[str]] = None,
+    param_grids: Optional[Dict[str, Any]] = None,
+    fit_params: Optional[Dict[str, Dict[str, Any]]] = None,
+    sampler: Optional[Any] = None,
+    cv: int = 4,
+    search_type: str = "grid",
+    primary_metric: Optional[str] = None,
+    top_k: Optional[int] = None,
+    quick_test_fraction: float = 0.2,
+    plot_lc: bool = True,
+    plot_diagnostics: bool = True,
+    plot_importance: bool = True,
     plot_comparison: bool = True,
-    plot_confusion_matrix: bool = True,
-    plot_roc_curve: bool = True,
-    enable_hyperparameter_tuning: bool = False,
-    hyperparameter_grids: Dict[str, Dict] = None,
-    top_k: int = None,
-    random_state: int = 42,
-) -> Dict[str, Dict[str, float]]
+    top_n_features: int = 20,
+    save_dir: Optional[str] = None,
+    resume: bool = False,
+    verbose: bool = True,
+) -> Dict[str, Any]
 ```
 
 ---
@@ -76,28 +87,361 @@ def evaluate_and_plot_models(
 
 ---
 
-### **Configuration Parameters**
+## 📖 Parameters
+
+### **Core Data Parameters**
+
+#### `models` (required)
+- **Type**: `Dict[str, Any]`
+- **Description**: Dictionary mapping model names to Scikit-Learn estimator instances
+- **Example**:
+  ```python
+  from sklearn.linear_model import LogisticRegression
+  from sklearn.ensemble import RandomForestClassifier
+  
+  models = {
+      "LogisticRegression": LogisticRegression(),
+      "RandomForest": RandomForestClassifier(random_state=42),
+  }
+  ```
+
+#### `preprocess_pipeline` (required)
+- **Type**: `Any` or `Dict[str, Any]`
+- **Description**: Sklearn Pipeline or dict mapping model names to preprocessing pipelines. Use "default" key as fallback for unlisted models.
+- **Example**:
+  ```python
+  from sklearn.preprocessing import StandardScaler, MinMaxScaler
+  from sklearn.pipeline import Pipeline
+  
+  # Single pipeline for all models
+  preprocess_pipeline = Pipeline([("scaler", StandardScaler())])
+  
+  # Per-model preprocessing (dict)
+  preprocess_pipeline = {
+      "LogisticRegression": Pipeline([("scaler", StandardScaler())]),
+      "RandomForest": None,  # No preprocessing
+      "default": Pipeline([("scaler", MinMaxScaler())])
+  }
+  ```
+
+#### `X` (required)
+- **Type**: `pd.DataFrame`
+- **Description**: Feature matrix with shape (n_samples, n_features)
+- **Example**: `X.shape  # (1000, 20)`
+
+#### `y` (required)
+- **Type**: `pd.Series`
+- **Description**: Target variable with shape (n_samples,)
+- **Example**: `y.shape  # (1000,)`
+
+---
+
+### **Data Splitting Parameters**
+
+#### `test_size`
+- **Type**: `float`
+- **Default**: `0.2`
+- **Range**: (0.0, 1.0)
+- **Description**: Fraction of data reserved for final test set
+- **Example**: `test_size=0.25  # Reserve 25% for testing`
+
+#### `val_size`
+- **Type**: `float`
+- **Default**: `0.0`
+- **Range**: [0.0, 1.0)
+- **Description**: Fraction of training data reserved for validation (used by boosting models for early stopping)
+- **Example**: `val_size=0.1  # 10% of training data for validation`
+
+#### `split_method`
+- **Type**: `str`
+- **Default**: `"random"`
+- **Options**: `"random"` or `"sequential"`
+- **Description**: Split strategy. Use "sequential" for time-series or financial data.
+- **Example**: `split_method="sequential"`
+
+#### `stratify`
+- **Type**: `bool`
+- **Default**: `True`
+- **Description**: Stratify splits by target class (classification only, ignored for regression)
+- **Example**: `stratify=False  # Don't stratify`
+
+#### `random_seed`
+- **Type**: `int`
+- **Default**: `42`
+- **Description**: Random state for reproducibility
+- **Example**: `random_seed=123`
+
+---
+
+### **Task Configuration Parameters**
 
 #### `task_type`
 - **Type**: `str`
 - **Default**: `"classification"`
 - **Options**: `"classification"` or `"regression"`
-- **Description**: Type of machine learning task
+- **Description**: Type of ML task; auto-switches metrics, cross-validation splitter, and plots
+- **Example**: `task_type="regression"`
+
+#### `target_names`
+- **Type**: `Optional[List[str]]`
+- **Default**: `None`
+- **Description**: Names of target classes (classification only) for reports
+- **Example**: `target_names=["negative", "positive"]`
+
+#### `feature_names`
+- **Type**: `Optional[List[str]]`
+- **Default**: `None`
+- **Description**: Original feature names for importance plots
+- **Example**: `feature_names=["age", "income", "credit_score"]`
+
+---
+
+### **Model Fitting Parameters**
+
+#### `param_grids`
+- **Type**: `Optional[Dict[str, Any]]`
+- **Default**: `None`
+- **Description**: Parameter grids for hyperparameter tuning keyed by model name
 - **Example**:
   ```python
-  task_type="classification"  # For classification
-  task_type="regression"      # For regression
+  param_grids={
+      "RandomForest": {
+          "n_estimators": [50, 100, 200],
+          "max_depth": [5, 10, None]
+      },
+      "SVM": {
+          "kernel": ["linear", "rbf"],
+          "C": [0.1, 1, 10]
+      }
+  }
   ```
 
-#### `primary_metric`
-- **Type**: `str`
-- **Default**: `"accuracy"`
-- **Classification Options**: `"accuracy"`, `"precision"`, `"recall"`, `"f1"`, `"auc"`
-- **Regression Options**: `"r2"`, `"mae"`, `"mse"`, `"rmse"`
-- **Description**: Main metric for model ranking
+#### `fit_params`
+- **Type**: `Optional[Dict[str, Dict[str, Any]]]`
+- **Default**: `None`
+- **Description**: Additional fit keyword arguments per model (e.g., early stopping)
 - **Example**:
   ```python
-  primary_metric="f1"  # Use F1-score as primary
+  fit_params={
+      "XGBoost": {"early_stopping_rounds": 10, "eval_metric": "logloss"}
+  }
+  ```
+
+#### `sampler`
+- **Type**: `Optional[Any]`
+- **Default**: `None`
+- **Description**: Imbalanced data sampler (e.g., SMOTE). Ignored for regression.
+- **Example**:
+  ```python
+  from imblearn.over_sampling import SMOTE
+  sampler=SMOTE(random_state=42)
+  ```
+
+#### `cv`
+- **Type**: `int`
+- **Default**: `4`
+- **Range**: 2+
+- **Description**: Number of cross-validation folds
+- **Example**: `cv=5`
+
+#### `search_type`
+- **Type**: `str`
+- **Default**: `"grid"`
+- **Options**: `"grid"`, `"random"`, or `"halving"`
+- **Description**: Hyperparameter search method. "halving" uses successive halving for large-scale tuning.
+- **Example**: `search_type="halving"`
+
+---
+
+### **Evaluation & Ranking Parameters**
+
+#### `primary_metric`
+- **Type**: `Optional[str]`
+- **Default**: `None` (auto-selected)
+- **Classification**: `"accuracy"`, `"precision"`, `"recall"`, `"f1"`, `"auc"`, `"kappa"`, `"log_loss"`
+- **Regression**: `"r2"`, `"mae"`, `"mse"`, `"rmse"`, `"mape"`, `"msle"`
+- **Description**: Main metric for model ranking
+- **Example**: `primary_metric="f1"`
+
+#### `top_k`
+- **Type**: `Optional[int]`
+- **Default**: `None` (evaluate all)
+- **Description**: Quick screening: evaluate top-k models on quick_test_fraction before full tuning
+- **Example**: `top_k=3  # Quickly screen to best 3, then tune fully`
+
+#### `quick_test_fraction`
+- **Type**: `float`
+- **Default**: `0.2`
+- **Range**: (0.0, 1.0)
+- **Description**: Fraction of training data for quick screening phase
+- **Example**: `quick_test_fraction=0.1`
+
+---
+
+### **Visualization Parameters**
+
+#### `plot_lc`
+- **Type**: `bool`
+- **Default**: `True`
+- **Description**: Generate learning curves
+- **Example**: `plot_lc=False`
+
+#### `plot_diagnostics`
+- **Type**: `bool`
+- **Default**: `True`
+- **Description**: Generate confusion matrices (classification) or residual plots (regression)
+- **Example**: `plot_diagnostics=False`
+
+#### `plot_importance`
+- **Type**: `bool`
+- **Default**: `True`
+- **Description**: Generate feature importance / coefficient plots
+- **Example**: `plot_importance=False`
+
+#### `plot_comparison`
+- **Type**: `bool`
+- **Default**: `True`
+- **Description**: Generate cross-validation score comparison boxplot
+- **Example**: `plot_comparison=False`
+
+#### `top_n_features`
+- **Type**: `int`
+- **Default**: `20`
+- **Description**: Number of top features to display in importance plot
+- **Example**: `top_n_features=10`
+
+---
+
+### **Checkpoint & Persistence Parameters**
+
+#### `save_dir`
+- **Type**: `Optional[str]`
+- **Default**: `None`
+- **Description**: Directory to save fitted models and checkpoint files. If None, no models saved.
+- **Example**: `save_dir="./models"`
+
+#### `resume`
+- **Type**: `bool`
+- **Default**: `False`
+- **Description**: If True and checkpoint exists, resume training from last completed model. If False, start fresh.
+- **Example**: `resume=True`
+
+---
+
+### **Logging Parameter**
+
+#### `verbose`
+- **Type**: `bool`
+- **Default**: `True`
+- **Description**: Print progress messages during evaluation
+- **Example**: `verbose=False`
+
+---
+
+## 📤 Return Value
+
+Returns `Dict[str, Any]` containing:
+
+- **`summary_df`**: DataFrame ranking all models by primary_metric
+- **`best_models`**: Dict mapping model names to fitted pipeline objects
+- **`raw_cv_scores`**: Dict mapping model names to cross-validation score arrays
+- **`ultimate_winner`**: Best performing model's fitted pipeline
+- **`data_splits`**: Dict with data splits:
+  ```
+  {
+      "X_train": pd.DataFrame,
+      "y_train": pd.Series,
+      "X_val": pd.DataFrame or None,
+      "y_val": pd.Series or None,
+      "X_test": pd.DataFrame,
+      "y_test": pd.Series
+  }
+  ```
+
+---
+
+## 🔍 Usage Examples
+
+### Classification with SMOTE
+
+```python
+from sklearn.datasets import load_breast_cancer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from imblearn.over_sampling import SMOTE
+from my_ml_toolkit import evaluate_and_plot_models
+
+# Load data
+X, y = load_breast_cancer(return_X_y=True, as_frame=True)
+
+# Define models
+models = {
+    "LogisticRegression": LogisticRegression(max_iter=1000),
+    "RandomForest": RandomForestClassifier(random_state=42),
+}
+
+# Preprocessing  
+preprocess_pipeline = Pipeline([("scaler", StandardScaler())])
+
+# Run evaluation
+results = evaluate_and_plot_models(
+    models=models,
+    preprocess_pipeline=preprocess_pipeline,
+    X=X,
+    y=y,
+    test_size=0.2,
+    task_type="classification",
+    sampler=SMOTE(random_state=42),
+    cv=5,
+    verbose=True,
+)
+
+print(results["summary_df"])
+best_model = results["ultimate_winner"]
+```
+
+### Regression with Hyperparameter Tuning
+
+```python
+from sklearn.datasets import load_diabetes
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from my_ml_toolkit import evaluate_and_plot_models
+
+# Load data
+X, y = load_diabetes(return_X_y=True, as_frame=True)
+
+# Define models and hyperparameter grids
+models = {
+    "RandomForest": RandomForestRegressor(random_state=42),
+    "GradientBoosting": GradientBoostingRegressor(random_state=42),
+}
+
+param_grids = {
+    "RandomForest": {
+        "n_estimators": [50, 100],
+        "max_depth": [5, 10],
+    },
+    "GradientBoosting": {
+        "learning_rate": [0.01, 0.1],
+        "n_estimators": [50, 100],
+    },
+}
+
+# Run evaluation
+results = evaluate_and_plot_models(
+    models=models,
+    preprocess_pipeline=None,
+    X=X,
+    y=y,
+    task_type="regression",
+    param_grids=param_grids,
+    search_type="grid",
+    cv=5,
+)
+
+print(results["summary_df"])
   ```
 
 #### `cv_folds`
