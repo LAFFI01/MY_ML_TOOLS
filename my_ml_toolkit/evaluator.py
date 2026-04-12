@@ -380,6 +380,8 @@ def evaluate_and_plot_models(
     save_dir: Optional[str] = None,
     resume: bool = False,         # <--- NEW: State check parameter
     show_fold_details: bool = True,  # <--- NEW: Display per-fold metrics
+    halving_factor: int = 3,      # <--- NEW: HalvingGridSearchCV efficiency control
+    memory_efficient: bool = False,  # <--- NEW: Memory optimization mode
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -438,6 +440,15 @@ def evaluate_and_plot_models(
             model. If False, start fresh. Default: False.
         show_fold_details: Whether to display per-fold cross-validation metrics 
             for each model during training. Useful for analyzing fold stability. Default: True.
+        halving_factor: Control the elimination factor for HalvingGridSearchCV.
+            Higher values = more candidates tested per round (slower but thorough).
+            - 2: Fastest (aggressive halving, 50% candidates eliminated per round)
+            - 3: Balanced (default, 67% candidates eliminated per round)
+            - 4-5: Thorough (70-80% candidates eliminated per round, slower).
+            Only used when search_type="halving". Default: 3.
+        memory_efficient: Enable memory-efficient mode for large datasets.
+            When True, disables learning curves, feature importance plots, and 
+            diagnostic plots to reduce RAM usage. Default: False.
         verbose: Whether to print progress messages. Default: True.
 
     Returns:
@@ -477,6 +488,23 @@ def evaluate_and_plot_models(
 
     if task_type not in ["classification", "regression"]:
         raise ValueError("task_type must be either 'classification' or 'regression'")
+
+    if search_type.lower() not in ["grid", "random", "halving"]:
+        raise ValueError(f"search_type must be 'grid', 'random', or 'halving'. Got: {search_type}")
+
+    # Memory efficiency mode setup
+    if memory_efficient:
+        vprint("\n" + "⚡" * 35)
+        vprint("⚡ MEMORY-EFFICIENT MODE ENABLED")
+        vprint("⚡" * 35)
+        plot_lc = False
+        plot_importance = False
+        plot_diagnostics = False
+        plot_comparison = False
+        vprint("  ✓ Disabled: Learning curves, feature importance, diagnostic plots")
+        vprint("  ✓ Reduced memory footprint for large datasets")
+        vprint("  ✓ Training will be significantly faster")
+        vprint("")
 
     if task_type == "classification":
         cv_splitter = StratifiedKFold(n_splits=cv, shuffle=True, random_state=random_seed)
@@ -671,16 +699,24 @@ def evaluate_and_plot_models(
                 if search_type_lower == "grid":
                     search_cls = GridSearchCV
                     kwargs = {"cv": cv_splitter, "scoring": primary_metric, "n_jobs": -1}
+                    search_label = "GridSearchCV (exhaustive search - tests all combinations)"
                 elif search_type_lower == "halving":
                     search_cls = HalvingGridSearchCV
-                    kwargs = {"cv": cv_splitter, "scoring": primary_metric, "n_jobs": -1, "random_state": random_seed}
+                    kwargs = {
+                        "cv": cv_splitter,
+                        "scoring": primary_metric,
+                        "n_jobs": -1,
+                        "random_state": random_seed,
+                        "factor": halving_factor,  # ← Control halving elimination rate
+                    }
+                    search_label = f"🚀 HalvingGridSearchCV (factor={halving_factor}, efficient successive halving)"
                 else:  # "random"
                     search_cls = RandomizedSearchCV
                     kwargs = {"cv": cv_splitter, "scoring": primary_metric, "n_jobs": -1, "n_iter": 10, "random_state": random_seed}
+                    search_label = "RandomizedSearchCV (random sampling of parameter space)"
 
-                vprint(
-                    f"[{name}] Running {search_cls.__name__} optimizing for '{primary_metric}'..."
-                )
+                vprint(f"[{name}] Running {search_label}")
+                vprint(f"       Optimizing for: '{primary_metric}' | CV Folds: {cv}")
                 search = search_cls(base_pipeline, param_grids[name], **kwargs)
                 search.fit(X_train, y_train, **f_kwargs)
                 pipeline = search.best_estimator_
