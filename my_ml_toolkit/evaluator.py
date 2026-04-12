@@ -105,6 +105,40 @@ def get_balanced_accuracy_scorer():
 # ==============================================================================
 
 
+def _print_fold_details(model_name: str, fold_scores: np.ndarray, metric_name: str = "accuracy", verbose: bool = True) -> Dict[str, float]:
+    """
+    Display detailed fold-by-fold cross-validation metrics.
+    
+    Args:
+        model_name: Name of the model
+        fold_scores: Array of scores for each fold
+        metric_name: Name of the metric being displayed
+        verbose: Whether to print details
+        
+    Returns:
+        Dictionary with fold stats (mean, std, min, max)
+    """
+    stats = {
+        "mean": np.mean(fold_scores),
+        "std": np.std(fold_scores),
+        "min": np.min(fold_scores),
+        "max": np.max(fold_scores),
+    }
+    
+    if verbose:
+        print(f"\n  📊 Fold-Level {metric_name.capitalize()} Scores for [{model_name}]:")
+        print(f"  {'-' * 60}")
+        for fold_idx, score in enumerate(fold_scores, 1):
+            print(f"    Fold {fold_idx}: {score:.6f}")
+        print(f"  {'-' * 60}")
+        print(f"    Mean:   {stats['mean']:.6f}")
+        print(f"    Std:    {stats['std']:.6f}")
+        print(f"    Min:    {stats['min']:.6f}")
+        print(f"    Max:    {stats['max']:.6f}")
+    
+    return stats
+
+
 
 def _validate_inputs(X: pd.DataFrame, y: pd.Series, test_size: float, val_size: float) -> None:
     """
@@ -345,6 +379,7 @@ def evaluate_and_plot_models(
     top_n_features: int = 20,
     save_dir: Optional[str] = None,
     resume: bool = False,         # <--- NEW: State check parameter
+    show_fold_details: bool = True,  # <--- NEW: Display per-fold metrics
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -401,6 +436,8 @@ def evaluate_and_plot_models(
             If None, no models saved. Default: None.
         resume: If True and checkpoint exists, resume training from last completed 
             model. If False, start fresh. Default: False.
+        show_fold_details: Whether to display per-fold cross-validation metrics 
+            for each model during training. Useful for analyzing fold stability. Default: True.
         verbose: Whether to print progress messages. Default: True.
 
     Returns:
@@ -690,6 +727,10 @@ def evaluate_and_plot_models(
             results_score.append(scores)
             successful_names.append(name)
             mean_cv, std_cv = np.mean(scores), np.std(scores)
+            
+            # Display fold-level details if requested
+            if show_fold_details:
+                _print_fold_details(name, scores, metric_name=str(primary_metric), verbose=verbose)
 
             if plot_lc:
                 vprint(f"[{name}] Generating Learning Curve...")
@@ -974,6 +1015,9 @@ def evaluate_and_plot_models(
                     "Model Name": name,
                     "Train Time": f"{elapsed_time:.1f}s",
                     f"CV Mean ({primary_metric})": f"{mean_cv:.3f} (±{std_cv:.3f})",
+                    f"CV Min": f"{np.min(scores):.3f}",
+                    f"CV Max": f"{np.max(scores):.3f}",
+                    f"CV Range": f"{np.max(scores) - np.min(scores):.3f}",
                     "Metric 1 Raw": metric1,
                     "Metric 2 Raw": metric2,
                     "Best Params": best_params_display,
