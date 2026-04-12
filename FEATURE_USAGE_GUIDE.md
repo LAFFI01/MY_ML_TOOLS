@@ -5,11 +5,91 @@ Comprehensive guide for using the latest ML Toolkit enhancements.
 ---
 
 ## 📋 Table of Contents
-1. [HalvingGridSearchCV](#halvinggridseachcv)
-2. [Classification Metrics](#classification-metrics)
-3. [Regression Metrics](#regression-metrics)
-4. [Checkpoint & Resume](#checkpoint--resume)
-5. [Complete Examples](#complete-examples)
+1. [Fold-Level Accuracy Tracking](#fold-level-accuracy-tracking)
+2. [HalvingGridSearchCV](#halvinggridseachcv)
+3. [Classification Metrics](#classification-metrics)
+4. [Regression Metrics](#regression-metrics)
+5. [Checkpoint & Resume](#checkpoint--resume)
+6. [Complete Examples](#complete-examples)
+
+---
+
+## Fold-Level Accuracy Tracking
+
+### Overview
+Monitor per-fold cross-validation metrics to analyze model stability and identify problematic folds.
+
+### Why Track Folds?
+- **Detect Overfitting**: Check if one fold performs much worse than others
+- **Fold Stability**: Identify inconsistent model performance across folds
+- **Outlier Folds**: Find splits that may contain unusual data patterns
+- **Fold Range**: Lower range = more stable model
+
+### Usage
+
+```python
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from my_ml_toolkit import evaluate_and_plot_models
+import pandas as pd
+
+# Your data
+X = pd.read_csv('features.csv')
+y = pd.read_csv('target.csv').squeeze()
+
+models = {
+    "RandomForest": RandomForestClassifier(random_state=42),
+    "LogisticRegression": LogisticRegression(max_iter=500)
+}
+
+preprocess_pipeline = Pipeline([("scaler", StandardScaler())])
+
+results = evaluate_and_plot_models(
+    models=models,
+    preprocess_pipeline=preprocess_pipeline,
+    X=X,
+    y=y,
+    task_type="classification",
+    cv=5,
+    show_fold_details=True,  # ← Display per-fold scores
+    verbose=True
+)
+```
+
+### Output Example
+```
+  📊 Fold-Level balanced_accuracy Scores for [Random Forest]:
+  Fold 1: 0.845238
+  Fold 2: 0.818452
+  Fold 3: 0.775298  ← Worst fold
+  Fold 4: 0.779762
+  Fold 5: 0.857143  ← Best fold
+  
+  Mean:   0.815179
+  Std:    0.033227  ← Standard deviation
+  Min:    0.775298
+  Max:    0.857143
+```
+
+### Programmatic Access
+```python
+# Get raw CV scores for all models
+raw_cv_scores = results['raw_cv_scores']
+
+for model_name, fold_scores in raw_cv_scores.items():
+    print(f"{model_name}:")
+    print(f"  Fold scores: {fold_scores}")
+    print(f"  Mean: {fold_scores.mean():.4f}")
+    print(f"  Std:  {fold_scores.std():.4f}")
+    print(f"  Range: {fold_scores.max() - fold_scores.min():.4f}")
+```
+
+### Summary Table Includes
+- `CV Mean (±Std)`: Average and standard deviation across folds
+- `CV Min`: Best fold performance
+- `CV Max`: Worst fold performance
+- `CV Range`: Consistency indicator (lower = more stable)
 
 ---
 
