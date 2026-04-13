@@ -250,35 +250,213 @@ For comprehensive API documentation, see [API_REFERENCE.md](API_REFERENCE.md).
 ### `evaluate_and_plot_models()`
 Returns a dictionary containing comprehensive evaluation results and trained models.
 
-**Key Parameters:**
+**Complete Parameter Reference (43 Parameters):**
 
+#### Core Data Parameters (Required)
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| **`models`** | `Dict[str, Any]` | Required | Dictionary mapping model names to Scikit-Learn estimator instances |
-| **`preprocess_pipeline`**| `Any \| Dict[str, Any]` | Required | Sklearn Pipeline or dict mapping model names to preprocessing pipelines |
-| **`X`, `y`** | `DataFrame, Series` | Required | Feature matrix and target vector for full dataset |
-| **`test_size`** | `float` | `0.2` | Fraction of data reserved for final testing |
-| **`val_size`** | `float` | `0.0` | Fraction of training data for validation (used by boosting models) |
+| **`models`** | `Dict[str, Any]` | **Required** | Dictionary mapping model names to Scikit-Learn estimator instances |
+| **`preprocess_pipeline`**| `Any \| Dict[str, Any]` | **Required** | Sklearn Pipeline or dict mapping model names to preprocessing pipelines |
+| **`X`** | `pd.DataFrame` | **Required** | Feature matrix for full dataset |
+| **`y`** | `pd.Series` | **Required** | Target vector for full dataset |
+
+#### Data Splitting Parameters
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| **`test_size`** | `float` | `0.2` | Fraction of data reserved for final testing (0-1) |
+| **`val_size`** | `float` | `0.0` | Fraction of training data for validation set (enables early stopping in boosters) |
+| **`split_method`** | `str` | `'random'` | `'random'` or `'sequential'` split method |
+| **`stratify`** | `bool` | `True` | Stratify splits by target for classification |
+| **`random_seed`** | `int` | `42` | Random state for reproducibility |
+
+#### Task Configuration
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
 | **`task_type`** | `str` | `'classification'`| `'classification'` or `'regression'` |
 | **`target_names`** | `List[str]` | `None` | Class names for confusion matrix labeling |
-| **`feature_names`** | `List[str]` | `None` | Feature names for importance plot labeling |
-| **`param_grids`** | `Dict[str, Dict]` | `None` | Hyperparameter grids for GridSearchCV |
-| **`sampler`** | `Any` | `None` | Imbalanced-learn sampler (e.g., SMOTE) |
+| **`feature_names`** | `List[str]` | `None` | Feature names for importance plot labeling (used by SHAP) |
+
+#### Hyperparameter Tuning
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| **`param_grids`** | `Dict[str, Any]` | `None` | Hyperparameter grids per model (e.g., `{'RandomForest': {'max_depth': [5, 10]}}`) |
+| **`fit_params`** | `Dict[str, Dict[str, Any]]` | `None` | Fit parameters per model (e.g., early stopping config) |
+| **`search_type`** | `str` | `'grid'` | `'grid'`, `'random'`, `'halving'`, or `'optuna'` |
+| **`primary_metric`** | `str` | `None` | Auto: `'accuracy'` (classification) or `'r2'` (regression) |
+
+#### Cross-Validation
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
 | **`cv`** | `int` | `4` | Number of cross-validation folds |
-| **`search_type`** | `str` | `'grid'` | `'grid'`, `'random'`, or `'halving'` |
-| **`top_k`** | `int` | `None` | Quick screening phase: evaluate all models on 20% of data, advance top K |
-| **`save_dir`** | `str` | `None` | Directory to save fitted models as pickle files |
-| **`resume`** | `bool` | `False` | Resume training from checkpoint if it exists |
-| **`verbose`** | `bool` | `True` | Print progress messages |
+| **`show_fold_details`** | `bool` | `True` | Print per-fold CV metrics breakdown |
 
-**Return Output:**
+#### Phase 1: Screening
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| **`top_k`** | `int` | `None` | Quick screening: test all models on `quick_test_fraction` data, advance only top K |
+| **`quick_test_fraction`** | `float` | `0.2` | Fraction of training data for Phase 1 screening (20%) |
 
-The function returns a dictionary with:
-* `'summary_df'`: Ranked DataFrame of all model metrics
-* `'best_models'`: Dict of all trained pipeline objects
-* `'raw_cv_scores'`: Raw numpy arrays of CV scores
-* `'ultimate_winner'`: Best performing pipeline
-* `'data_splits'`: Dict with X_train, y_train, X_val, y_val, X_test, y_test
+#### Phase 2: Tuning Search Methods
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| **`halving_factor`** | `int` | `3` | Reduction factor for HalvingGridSearchCV (successive halving) |
+
+#### Phase 5: Optuna Distributed Tuning
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| **`optuna_n_trials`** | `int` | `50` | Number of Optuna Bayesian optimization trials |
+| **`optuna_timeout`** | `int` | `None` | Timeout in seconds for Optuna search (None = no limit) |
+| **`optuna_storage`** | `str` | `None` | Persistent storage backend: `'sqlite:///automl_optuna.db'` or `'redis://host:6379'` |
+| **`optuna_study_name`** | `str` | `None` | Study name for resuming distributed trials across notebooks |
+| **`distributed_tuning`** | `bool` | `False` | Enable distributed Optuna (multiple notebooks share same database) |
+
+#### Phase 6: Data Validation
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| **`validate_data`** | `bool` | `True` | Enable Pandera data validation (catches NaN, type mismatches early) |
+
+#### Phase 3: Ensemble & Storage
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| **`build_ensemble`** | `bool` | `True` | Phase 3: Build stacking ensemble from top K models |
+| **`save_dir`** | `str` | `None` | Directory to save fitted models, checkpoints, and results |
+| **`resume`** | `bool` | `False` | Resume training from checkpoint file if exists |
+
+#### Plotting Parameters
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| **`plot_lc`** | `bool` | `True` | Plot learning curves (training/validation loss vs sample size) |
+| **`plot_diagnostics`** | `bool` | `True` | Plot diagnostic charts (confusion matrix / predicted vs actual) |
+| **`plot_importance`** | `bool` | `True` | Plot feature importance (top 20 features) |
+| **`plot_comparison`** | `bool` | `True` | Plot model comparison boxplots |
+| **`top_n_features`** | `int` | `20` | Number of top features to display in importance plot |
+
+#### Imbalanced Data Handling
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| **`sampler`** | `Any` | `None` | Imbalanced-learn sampler (e.g., `SMOTE()`, `RandomOverSampler()`) |
+
+#### MLflow & Logging
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| **`mlflow_experiment`** | `str` | `'AutoML_Run'` | MLflow experiment name for run tracking and logging |
+
+#### Performance & Utility
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| **`memory_efficient`** | `bool` | `False` | Disable plotting/diagnostics for memory-constrained environments |
+| **`verbose`** | `bool` | `True` | Print progress messages and detailed metrics |
+
+#### Return Output
+
+```python
+{
+    'summary_df': pd.DataFrame,              # Ranked model performance table
+    'best_models': Dict[str, model],         # All trained models + ensemble
+    'raw_cv_scores': Dict[str, np.ndarray],  # Per-model CV fold scores
+    'ultimate_winner': model,                # Best calibrated model
+    'data_splits': {                         # Train/val/test splits
+        'X_train': pd.DataFrame,
+        'y_train': pd.Series,
+        'X_val': pd.DataFrame,
+        'y_val': pd.Series,
+        'X_test': pd.DataFrame,
+        'y_test': pd.Series
+    }
+}
+```
+
+---
+
+### Advanced Usage Examples
+
+#### Example 1: Distributed Optuna Tuning (Kaggle 3x Speedup)
+```python
+# All three Kaggle notebooks use IDENTICAL parameters:
+results = evaluate_and_plot_models(
+    models={'RandomForest': RandomForestClassifier()},
+    preprocess_pipeline=None,
+    X=X,
+    y=y,
+    search_type='optuna',
+    optuna_n_trials=150,                           # Total trials
+    optuna_storage='sqlite:///automl_optuna.db',   # Shared database
+    optuna_study_name='kaggle_competition_1',      # Shared study
+    distributed_tuning=True,                        # Enable collaboration
+    verbose=True
+)
+# Result: 3 notebooks run 50 trials each in parallel → 3x speedup! 🚀
+```
+
+#### Example 2: Production Data Validation
+```python
+# Automatic data quality checks before modeling
+results = evaluate_and_plot_models(
+    models=models,
+    preprocess_pipeline=None,
+    X=X,  # Catches NaN, type mismatches, duplicates automatically
+    y=y,
+    validate_data=True,  # Enabled by default
+    verbose=True
+)
+# Output:
+# 🔍 DATA QUALITY VALIDATION
+# ✓ Shape: X=(10000, 50), y=(10000,)
+# ✓ Pandera Schema validation passed for 50 columns
+# ✅ Data Contract: PASSED
+```
+
+#### Example 3: SHAP Feature Importance + Probability Calibration
+```python
+# Production-grade explainability + accurate probabilities
+results = evaluate_and_plot_models(
+    models={'RandomForest': RandomForestClassifier()},
+    preprocess_pipeline=None,
+    X=X,
+    y=y,
+    feature_names=['age', 'income', 'credit_score'],  # Enables SHAP
+    task_type='classification',
+    verbose=True
+)
+# Output:
+# 🎯 SHAP Feature Importance (Game Theory Based) [RandomForest]:
+#    Explainer: TreeExplainer | 50 features analyzed
+#    1. age                      25.32% █████████████
+#       └─ This feature's values explain 25.3% of predictions
+#    2. income                   18.45% ██████████
+#       └─ This feature's values explain 18.5% of predictions
+#
+# 📊 PHASE 4: PROBABILITY CALIBRATION
+# 📈 Calibration Impact:
+#    ECE Before: 0.1245
+#    ECE After:  0.0582 (↓ 53.2% improvement)
+#    Log-Loss Before: 0.4521
+#    Log-Loss After:  0.3891 (↓ 13.9% improvement)
+# 🎯 Kaggle Log-Loss Advantage: ~13.9% improvement expected
+```
+
+#### Example 4: Early Stopping + Checkpoint Resume
+```python
+# Train with validation set and resume if interrupted
+results = evaluate_and_plot_models(
+    models={'XGBoost': XGBClassifier()},
+    preprocess_pipeline=None,
+    X=X,
+    y=y,
+    val_size=0.1,        # Enables early stopping for boosters
+    search_type='grid',
+    param_grids={
+        'XGBoost': {'max_depth': [5, 10], 'learning_rate': [0.01, 0.1]}
+    },
+    save_dir='./checkpoints',  # Save progress
+    resume=True,               # Resume if interrupted
+    verbose=True
+)
+# Auto-configures early stopping per framework:
+# - XGBoost: eval_set injection
+# - LightGBM: callbacks with lgb.early_stopping()
+# - CatBoost: early_stopping_rounds parameter
+```
 
 ---
 
