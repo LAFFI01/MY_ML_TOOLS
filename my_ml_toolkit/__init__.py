@@ -10,12 +10,14 @@ from .evaluator import (
     evaluate_and_plot_models,
     balanced_multiclass_accuracy,
     get_balanced_accuracy_scorer,
+    optimize_dtypes,
 )
 
 __all__ = [
     "evaluate_and_plot_models",
     "balanced_multiclass_accuracy",
     "get_balanced_accuracy_scorer",
+    "optimize_dtypes",
     "__version__",
     "__author__",
     "__license__",
