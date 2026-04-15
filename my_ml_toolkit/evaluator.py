@@ -455,8 +455,9 @@ def _configure_early_stopping(model, early_stopping_rounds: int = 50) -> Dict[st
         fit_params["early_stopping_rounds"] = early_stopping_rounds
         
     elif "XGB" in model_cls_name or "xgboost" in str(model_cls_name).lower():
-        # XGBoost: early_stopping_rounds should be in model init via fit_params callback
-        fit_params["eval_metric"] = "logloss"  # Default, will be overridden by eval_set
+        # XGBoost: eval_metric should be in model init, not fit params
+        # Early stopping will be handled via eval_set callback
+        pass  # No fit_params needed for XGBoost early stopping
     
     return fit_params
 
