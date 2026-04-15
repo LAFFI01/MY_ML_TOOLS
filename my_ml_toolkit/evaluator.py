@@ -436,7 +436,7 @@ def _configure_early_stopping(model, early_stopping_rounds: int = 50) -> Dict[st
         early_stopping_rounds: Number of rounds without improvement to trigger stop
         
     Returns:
-        Dict with early stopping config (empty if model doesn't support it)
+        Dict with early stopping config (with model__ prefix for pipeline compatibility)
     """
     model_cls_name = type(model).__name__
     fit_params = {}
@@ -444,7 +444,7 @@ def _configure_early_stopping(model, early_stopping_rounds: int = 50) -> Dict[st
     if "LightGBM" in model_cls_name or "LGBM" in model_cls_name:
         try:
             import lightgbm as lgb
-            fit_params["callbacks"] = [
+            fit_params["model__callbacks"] = [
                 lgb.early_stopping(early_stopping_rounds),
                 lgb.log_evaluation(period=0),
             ]
@@ -452,7 +452,7 @@ def _configure_early_stopping(model, early_stopping_rounds: int = 50) -> Dict[st
             pass
             
     elif "CatBoost" in model_cls_name or "Catboost" in model_cls_name:
-        fit_params["early_stopping_rounds"] = early_stopping_rounds
+        fit_params["model__early_stopping_rounds"] = early_stopping_rounds
         
     elif "XGB" in model_cls_name or "xgboost" in str(model_cls_name).lower():
         # XGBoost: eval_metric should be in model init, not fit params
@@ -1472,6 +1472,12 @@ def evaluate_and_plot_models(
                                 current_preprocessor, sampler, trial_model, fitted_preprocessor_cache, cachedir
                             )
                     
+                            # NOTE: During CV in hyperparameter tuning, do NOT use early stopping params
+                            # Early stopping requires explicit eval_set with proper validation data,
+                            # which is not available in standard CV. Only use params for base model attrs.
+                            cv_only_params = {k: v for k, v in f_kwargs.items() 
+                                             if not any(x in k for x in ['eval_set', 'callbacks', 'early_stopping', 'early_stopping_rounds'])}
+                    
                             with threadpool_limits(limits=1, user_api='blas'):
                                 with threadpool_limits(limits=1, user_api='openmp'):
                                     scores = cross_val_score(
@@ -1481,7 +1487,7 @@ def evaluate_and_plot_models(
                                         cv=cv_splitter,
                                         scoring=primary_metric,
                                         n_jobs=-1,
-                                        params=f_kwargs,
+                                        params=cv_only_params,
                                     )
                     
                             return np.mean(scores)
@@ -1513,9 +1519,13 @@ def evaluate_and_plot_models(
                             current_preprocessor, sampler, best_trial_model, fitted_preprocessor_cache, cachedir
                         )
                 
+                        # Filter out early stopping params that require eval_set
+                        safe_fit_kwargs = {k: v for k, v in f_kwargs.items() 
+                                          if not any(x in k for x in ['eval_set', 'callbacks', 'early_stopping', 'early_stopping_rounds'])}
+                        
                         with threadpool_limits(limits=1, user_api='blas'):
                             with threadpool_limits(limits=1, user_api='openmp'):
-                                pipeline.fit(X_train, y_train, **f_kwargs)
+                                pipeline.fit(X_train, y_train, **safe_fit_kwargs)
                 
                         clean_params = {k: v for k, v in best_trial_params.items()}
                         best_params_display = str(clean_params)
@@ -1537,9 +1547,12 @@ def evaluate_and_plot_models(
                         best_params_display = str(clean_params)
                 else:
                     vprint(f"[{name}] No param grid provided. Training base model...")
+                    # Filter out early stopping params that require eval_set
+                    safe_fit_kwargs = {k: v for k, v in f_kwargs.items() 
+                                      if not any(x in k for x in ['eval_set', 'callbacks', 'early_stopping', 'early_stopping_rounds'])}
                     with threadpool_limits(limits=1, user_api='blas'):
                         with threadpool_limits(limits=1, user_api='openmp'):
-                            pipeline.fit(X_train, y_train, **f_kwargs)
+                            pipeline.fit(X_train, y_train, **safe_fit_kwargs)
 
                 best_estimators[name] = pipeline
                 successful_names.append(name)
@@ -1751,7 +1764,28 @@ def evaluate_and_plot_models(
                     print(summary_df.to_string(index=False))
                 print("=" * 100)
 
-        ultimate_winner = best_estimators[summary_df.iloc[0]["Model Name"]] if (not summary_df.empty and len(best_estimators) > 0) else (best_estimators[successful_names[0]] if successful_names else None)
+        # Clean model name by removing emojis for dictionary lookup
+        ultimate_winner = None
+        if not summary_df.empty and len(best_estimators) > 0:
+            model_name = summary_df.iloc[0]["Model Name"]
+            # Try exact match first
+            if model_name in best_estimators:
+                ultimate_winner = best_estimators[model_name]
+            else:
+                # Try normalized versions
+                normalized_name = model_name.replace("🌟 ", "🌟_")
+                if normalized_name in best_estimators:
+                    ultimate_winner = best_estimators[normalized_name]
+                else:
+                    # Fallback to first successful model by name
+                    for sname in successful_names:
+                        if sname in best_estimators:
+                            ultimate_winner = best_estimators[sname]
+                            break
+        
+        # Final fallback if nothing matched
+        if ultimate_winner is None and best_estimators and successful_names:
+            ultimate_winner = best_estimators[successful_names[0]]
 
         # ==============================================================================
         # 📊 PHASE 4: PROBABILITY CALIBRATION (Classification Only)
