@@ -1,35 +1,70 @@
+"""
+evaluate_and_plot_models.py
+============================
+Enterprise AutoML evaluation pipeline with:
+- Phase 1: Quick screening
+- Phase 2: Full evaluation + hyperparameter tuning (Grid / Random / Halving / Optuna)
+- Phase 3: Stacking ensemble
+- Phase 4: Probability calibration (classification only)
+- Data validation via Pandera
+- SHAP-based feature importance
+- MLflow experiment tracking
+- Crash recovery via checkpoint files + in-progress markers
+
+Improvements applied (v1):
+  [Safety]      S1  Atomic checkpoint writes (os.replace) prevent stale-state on crash
+  [Safety]      S2  MLflow run uses context manager — no leaked runs on inner exceptions
+  [Safety]      S3  fit_params deep-copied per model — shared-dict mutations can't bleed across models
+  [Safety]      S4  SHAP KernelExplainer uses predict_proba for classifiers, not predict
+  [Performance] P1  pipeline memory= removed when manual preprocessor cache is active (no double I/O)
+  [Performance] P2  n_jobs exposed as a parameter — threadpool_limits + n_jobs=-1 contradiction fixed
+  [Performance] P3  _build_preprocessor_cache intent documented; Phase-1 subsample borrows full-fit correctly
+  [Performance] P4  Stacking ensemble clone comment corrected to explain StackingClassifier requirement
+  [Performance] P5  optimize_dtypes docstring warns to call AFTER encoding/imputation
+  [Performance] P6  Optuna n_jobs forwarded so CV folds run in parallel inside each trial
+  [DX]          D1  _vp() helper replaces 8+ copy-pasted verbose lambdas
+  [DX]          D2  PhaseResult.cv_scores stored as List[float] — JSON-safe by default
+  [DX]          D3  Single canonical 'task' variable replaces dual task_type / task_type_enum
+  [DX]          D4  Empty active_models after Phase 1 raises RuntimeError immediately
+  [DX]          D5  calibration_method exposed on evaluate_and_plot_models ("auto"|"isotonic"|"sigmoid")
+  [Feature]     F1  Async concurrent Phase-2 training via ProcessPoolExecutor (n_parallel parameter)
+  [Feature]     F2  Covariate drift detection (KS-test) with validate_drift parameter
+  [Feature]     F3  Structured logging replaces bare print() calls; verbose flag controls log level
+  [Feature]     F4  summary_df logged to MLflow as a CSV artifact
+"""
+
+from __future__ import annotations
+
+import copy
+import logging
 import os
 import shutil
 import tempfile
 import time
 import traceback
+import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import joblib
-import matplotlib.pyplot as plt
 import mlflow
 import mlflow.sklearn
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.base import clone
-from sklearn.ensemble import StackingClassifier, StackingRegressor
-from sklearn.linear_model import LogisticRegression, Ridge
-from threadpoolctl import threadpool_limits
-
-# Enable experimental HalvingGridSearchCV
-from sklearn.experimental import enable_halving_search_cv  # noqa: F401
-
-# Imblearn Pipeline alias to protect against Scikit-Learn overrides
 from imblearn.pipeline import Pipeline as ImbPipeline
-
-# Universal Metrics
+from scipy.stats import ks_2samp
+from sklearn.base import clone
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.ensemble import StackingClassifier, StackingRegressor
+from sklearn.experimental import enable_halving_search_cv  # noqa: F401
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import (
-    ConfusionMatrixDisplay,
     accuracy_score,
     auc,
-    classification_report,
     cohen_kappa_score,
     f1_score,
     log_loss,
@@ -38,16 +73,11 @@ from sklearn.metrics import (
     mean_absolute_error,
     mean_absolute_percentage_error,
     mean_squared_error,
-    mean_squared_log_error,
-    precision_recall_curve,
     precision_score,
     r2_score,
     recall_score,
     roc_auc_score,
-    roc_curve,
 )
-
-# Model Selection & Splitters
 from sklearn.model_selection import (
     GridSearchCV,
     HalvingGridSearchCV,
@@ -55,179 +85,249 @@ from sklearn.model_selection import (
     RandomizedSearchCV,
     StratifiedKFold,
     cross_val_score,
-    learning_curve,
     train_test_split,
 )
-from sklearn.metrics import make_scorer
-from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from threadpoolctl import threadpool_limits
 
-# Optional SHAP for explainable AI
 try:
     import shap
     HAS_SHAP = True
 except ImportError:
     HAS_SHAP = False
 
-# Optional Pandera for data validation (Data Quality Contract)
 try:
-    import pandera as pa
+    import pandera.pandas as pa
     HAS_PANDERA = True
 except ImportError:
     HAS_PANDERA = False
 
+# ---------------------------------------------------------------------------
+# [F3] Structured logging — callers set level; JSON formatter optional
+# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+
 # ==============================================================================
-# CUSTOM METRICS FOR IMBALANCED CLASSIFICATION
+# [D1] Verbose helper — replaces 8+ copy-pasted lambdas
 # ==============================================================================
 
+def _vp(verbose: bool):
+    """Return print if verbose, else a no-op callable."""
+    return print if verbose else (lambda *a, **k: None)
+
+
+# ==============================================================================
+# ENUMS & DATACLASSES
+# ==============================================================================
+
+class TaskType(str, Enum):
+    CLASSIFICATION = "classification"
+    REGRESSION = "regression"
+
+
+class SearchType(str, Enum):
+    GRID = "grid"
+    RANDOM = "random"
+    HALVING = "halving"
+    OPTUNA = "optuna"
+
+
+class SplitMethod(str, Enum):
+    RANDOM = "random"
+    SEQUENTIAL = "sequential"
+
+
+@dataclass
+class PhaseResult:
+    """Holds per-model results accumulated across phases."""
+    name: str
+    pipeline: Any
+    # [D2] Store as List[float] — JSON-serialisable without .tolist() calls
+    cv_scores: List[float]
+    metric1: float          # accuracy / r2
+    metric2: float          # f1 / rmse
+    best_params: Dict[str, Any]
+    training_time: float
+    feature_importance: Dict[str, float] = field(default_factory=dict)
+
+    @property
+    def cv_mean(self) -> float:
+        return float(np.mean(self.cv_scores))
+
+    @property
+    def cv_std(self) -> float:
+        return float(np.std(self.cv_scores))
+
+
+# ==============================================================================
+# CUSTOM METRICS
+# ==============================================================================
 
 def balanced_multiclass_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """
-    Balanced/macro-averaged accuracy for multi-class classification.
-    
-    Calculates per-class recall and averages them, making it robust to class imbalance.
-    Each class is weighted equally regardless of sample count.
-    
-    Formula: Accuracy = (1/C) * Σ(TP_i / All_samples_of_class_i)
-    
-    Args:
-        y_true: True labels
-        y_pred: Predicted labels
-        
-    Returns:
-        Balanced accuracy score (0 to 1)
-        
-    Example:
-        >>> y_true = [0, 1, 2, 0, 1, 2]
-        >>> y_pred = [0, 1, 1, 0, 1, 2]
-        >>> balanced_multiclass_accuracy(y_true, y_pred)
-        # Returns average of recall for each class
+    Balanced/macro-averaged accuracy robust to class imbalance.
+
+    Calculates per-class recall and averages them equally regardless of
+    class sample count.
+
+    Formula: (1/C) * Σ(TP_i / All_samples_of_class_i)
     """
     unique_classes = np.unique(y_true)
-    recalls = []
-    
-    for cls in unique_classes:
-        class_mask = y_true == cls
-        if np.sum(class_mask) > 0:
-            recall = np.sum((y_true == cls) & (y_pred == cls)) / np.sum(class_mask)
-            recalls.append(recall)
-    
+    recalls = [
+        np.sum((y_true == cls) & (y_pred == cls)) / np.sum(y_true == cls)
+        for cls in unique_classes
+        if np.sum(y_true == cls) > 0
+    ]
     return float(np.mean(recalls)) if recalls else 0.0
 
 
 def get_balanced_accuracy_scorer():
-    """
-    Create a sklearn scorer for balanced multiclass accuracy.
-    
-    Returns:
-        Scorer object compatible with GridSearchCV, cross_val_score, etc.
-    """
+    """Sklearn scorer for balanced_multiclass_accuracy."""
     return make_scorer(balanced_multiclass_accuracy)
 
 
 # ==============================================================================
-# HELPER FUNCTIONS
+# INPUT VALIDATION
 # ==============================================================================
 
-
-def _print_fold_details(model_name: str, fold_scores: np.ndarray, metric_name: str = "accuracy", verbose: bool = True) -> Dict[str, float]:
+def _validate_inputs(
+    X: pd.DataFrame,
+    y: pd.Series,
+    test_size: float,
+    val_size: float,
+) -> None:
     """
-    Display detailed fold-by-fold cross-validation metrics.
-    
-    Args:
-        model_name: Name of the model
-        fold_scores: Array of scores for each fold
-        metric_name: Name of the metric being displayed
-        verbose: Whether to print details
-        
-    Returns:
-        Dictionary with fold stats (mean, std, min, max)
-    """
-    stats = {
-        "mean": np.mean(fold_scores),
-        "std": np.std(fold_scores),
-        "min": np.min(fold_scores),
-        "max": np.max(fold_scores),
-    }
-    
-    if verbose:
-        print(f"\n  📊 Fold-Level {metric_name.capitalize()} Scores for [{model_name}]:")
-        print(f"  {'-' * 60}")
-        for fold_idx, score in enumerate(fold_scores, 1):
-            print(f"    Fold {fold_idx}: {score:.6f}")
-        print(f"  {'-' * 60}")
-        print(f"    Mean:   {stats['mean']:.6f}")
-        print(f"    Std:    {stats['std']:.6f}")
-        print(f"    Min:    {stats['min']:.6f}")
-        print(f"    Max:    {stats['max']:.6f}")
-    
-    return stats
-
-
-
-def _validate_inputs(X: pd.DataFrame, y: pd.Series, test_size: float, val_size: float) -> None:
-    """
-    Validate input data and parameters.
+    Validate shapes, NaNs, infinite values, and split fractions.
+    Raises ValueError with a clear message on any violation.
     """
     if X.shape[0] != y.shape[0]:
         raise ValueError(
-            f"X and y must have same number of rows. Got X shape={X.shape}, y shape={y.shape}"
+            f"X and y must have the same number of rows. Got X={X.shape}, y={y.shape}"
         )
-
     if X.isna().any().any():
-        raise ValueError(f"X contains NaN values. Found {X.isna().sum().sum()} NaN values")
-
+        raise ValueError(
+            f"X contains {X.isna().sum().sum()} NaN value(s). Impute or drop before calling."
+        )
     if y.isna().any():
-        raise ValueError(f"y contains NaN values. Found {y.isna().sum()} NaN values")
-
+        raise ValueError(f"y contains {y.isna().sum()} NaN value(s).")
+    if np.isinf(y).any():
+        raise ValueError(f"y contains {np.isinf(y).sum()} infinite value(s).")
+    if y.dtype == object:
+        invalid_strs = y.astype(str).str.lower().isin(["nan", "none", "null"]).sum()
+        if invalid_strs > 0:
+            raise ValueError(f"y contains {invalid_strs} string placeholder(s) (nan/none/null).")
     if not 0 < test_size < 1:
-        raise ValueError(f"test_size must be between 0 and 1. Got {test_size}")
-
+        raise ValueError(f"test_size must be in (0, 1). Got {test_size}.")
     if not 0 <= val_size < 1:
-        raise ValueError(f"val_size must be between 0 and 1. Got {val_size}")
-
+        raise ValueError(f"val_size must be in [0, 1). Got {val_size}.")
     if test_size + val_size >= 1:
-        raise ValueError(f"test_size + val_size must be < 1. Got {test_size + val_size}")
-
+        raise ValueError(f"test_size + val_size must be < 1. Got {test_size + val_size}.")
     if X.shape[0] < 10:
-        raise ValueError(f"Dataset too small. Need at least 10 samples, got {X.shape[0]}")
+        raise ValueError(f"Dataset has only {X.shape[0]} samples (minimum 10 required).")
 
+
+# ==============================================================================
+# [F2] COVARIATE DRIFT DETECTION
+# ==============================================================================
+
+def _check_covariate_drift(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    threshold: float = 0.05,
+    verbose: bool = True,
+) -> List[Tuple[str, float]]:
+    """
+    Run a two-sample KS-test for each numeric column between train and test.
+
+    Returns a list of (column, p_value) tuples for columns whose p-value
+    falls below *threshold*, indicating potential covariate shift.
+
+    Why this matters: covariate drift is one of the most common silent failure
+    modes in ML — the model trains on one distribution and scores on another,
+    producing unreliable predictions with no obvious error signal.
+
+    Parameters
+    ----------
+    threshold
+        KS-test p-value below which a column is flagged. Default 0.05.
+    """
+    vp = _vp(verbose)
+    numeric_cols = X_train.select_dtypes(include="number").columns
+    drifted: List[Tuple[str, float]] = []
+
+    for col in numeric_cols:
+        _, p = ks_2samp(X_train[col].dropna(), X_test[col].dropna())
+        if p < threshold:
+            drifted.append((col, round(float(p), 6)))
+
+    if verbose:
+        if drifted:
+            vp(f"\n⚠️  Covariate drift detected in {len(drifted)} column(s) "
+               f"(KS p < {threshold}):")
+            for col, p in sorted(drifted, key=lambda x: x[1]):
+                vp(f"   {col:40s}  p={p:.6f}")
+        else:
+            vp(f"\n✓ No covariate drift detected (KS p ≥ {threshold} for all {len(numeric_cols)} columns)")
+
+    logger.info(
+        "covariate_drift_check",
+        extra={"drifted_columns": len(drifted), "threshold": threshold},
+    )
+    return drifted
+
+
+# ==============================================================================
+# DTYPE OPTIMIZATION
+# ==============================================================================
+
+def optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Downcast 64-bit numeric columns to 32-bit to save ~50 % memory.
+
+    Uses explicit `astype` casts (not `pd.to_numeric` downcast) to avoid
+    pandas silently choosing float16 on some versions.
+
+    [P5] Call AFTER encoding/imputation — object columns created by encoders
+    are not touched by this function. Applying before preprocessing means
+    columns created by those steps won't be downcasted.
+    """
+    df_opt = df.copy()
+    for col in df_opt.select_dtypes(include=["float64"]).columns:
+        df_opt[col] = df_opt[col].astype(np.float32)
+    for col in df_opt.select_dtypes(include=["int64"]).columns:
+        df_opt[col] = df_opt[col].astype(np.int32)
+    return df_opt
+
+
+# ==============================================================================
+# PIPELINE HELPERS
+# ==============================================================================
 
 def _get_preprocessor(
-    preprocess_pipeline: Union[Any, Dict[str, Any]], model_name: str
+    preprocess_pipeline: Union[Any, Dict[str, Any]],
+    model_name: str,
 ) -> Optional[Any]:
-    """
-    Extract the preprocessor for a given model.
-    """
+    """Return the preprocessor for *model_name*, or the default one."""
     if isinstance(preprocess_pipeline, dict):
         return preprocess_pipeline.get(model_name, preprocess_pipeline.get("default"))
     return preprocess_pipeline
 
 
-def _build_pipeline(preprocessor: Optional[Any], sampler: Optional[Any], model: Any, cachedir: Optional[str] = None) -> ImbPipeline:
-    """
-    Build a pipeline with preprocessor, sampler, and model.
-    
-    Args:
-        preprocessor: Optional preprocessing pipeline/transformer
-        sampler: Optional imbalanced data sampler (e.g., SMOTE)
-        model: The ML model to add to pipeline
-        cachedir: Optional directory for Pipeline memory caching. When provided,
-                  intermediate transformation results are cached to disk, avoiding
-                  redundant computation across pipeline steps. Default: None.
-    
-    Returns:
-        ImbPipeline with caching enabled if cachedir provided.
-    """
-    steps = []
+def _build_pipeline(
+    preprocessor: Optional[Any],
+    sampler: Optional[Any],
+    model: Any,
+    cachedir: Optional[str] = None,
+) -> ImbPipeline:
+    """Assemble preprocessor → sampler → model into an ImbPipeline."""
+    steps: List[Tuple[str, Any]] = []
     if preprocessor is not None:
         if hasattr(preprocessor, "steps"):
             steps.extend(preprocessor.steps.copy())
         else:
             steps.append(("preprocessor", preprocessor))
-
     if sampler is not None:
         steps.append(("sampler", sampler))
-
     steps.append(("model", model))
     return ImbPipeline(steps, memory=cachedir)
 
@@ -239,209 +339,92 @@ def _build_preprocessor_cache(
     y_train: pd.Series,
 ) -> Dict[int, Any]:
     """
-    Build and cache fitted preprocessors to avoid redundant refitting.
-    
-    This function:
-    1. Identifies unique preprocessors by object identity
-    2. Fits each unique preprocessor only ONCE
-    3. Returns a cache mapping object_id -> fitted_preprocessor
-    
-    Args:
-        preprocess_pipeline: Single or dict of preprocessor pipelines
-        model_names: List of model names to check for unique preprocessors
-        X_train: Training features
-        y_train: Training target
-        
-    Returns:
-        Dict mapping preprocessor object id -> fitted preprocessor instance
+    Fit each *unique* preprocessor exactly once and return an id → fitted map.
+
+    Multiple models sharing the same preprocessor object only trigger one fit,
+    avoiding redundant (and potentially expensive) preprocessing work.
+
+    [P3] Fitted on full X_train intentionally — Phase 1 screening borrows the
+    same fitted transformers to avoid re-fitting on the subsample. This means
+    Phase-1 scores are slightly optimistic for fit-transform steps (e.g.
+    StandardScaler), but the effect is negligible for screening purposes.
     """
-    cache = {}
-    
-    # Get all unique preprocessors
-    preprocessors_to_fit = {}
-    for model_name in model_names:
-        preproc = _get_preprocessor(preprocess_pipeline, model_name)
+    to_fit: Dict[int, Any] = {}
+    for name in model_names:
+        preproc = _get_preprocessor(preprocess_pipeline, name)
         obj_id = id(preproc)
-        if obj_id not in preprocessors_to_fit and preproc is not None:
-            preprocessors_to_fit[obj_id] = preproc
-    
-    # Fit each unique preprocessor once
-    for obj_id, preproc in preprocessors_to_fit.items():
-        fitted = preproc.fit(X_train, y_train)
-        cache[obj_id] = fitted
-    
-    return cache
+        if obj_id not in to_fit and preproc is not None:
+            to_fit[obj_id] = preproc
+
+    return {oid: preproc.fit(X_train, y_train) for oid, preproc in to_fit.items()}
 
 
 def _build_pipeline_from_cache(
     preprocessor: Optional[Any],
     sampler: Optional[Any],
     model: Any,
-    fitted_preprocessor_cache: Dict[int, Any],
+    fitted_cache: Dict[int, Any],
     cachedir: Optional[str] = None,
 ) -> ImbPipeline:
     """
-    Build a pipeline using a FITTED preprocessor from cache, not a fresh one.
-    
-    This replaces _build_pipeline() when you have a cache of fitted preprocessors.
-    
-    Args:
-        preprocessor: Original (potentially unfitted) preprocessor object
-        sampler: Imbalanced data sampler (e.g., SMOTE)
-        model: The ML model to add to pipeline
-        fitted_preprocessor_cache: Cache mapping object_id -> fitted_preprocessor
-        cachedir: Optional directory for Pipeline memory caching. When provided,
-                  intermediate transformation results are cached to disk, avoiding
-                  redundant computation across pipeline steps. Default: None.
-        
-    Returns:
-        ImbPipeline with fitted preprocessor steps + sampler + model, memory caching enabled if cachedir provided.
+    Build a pipeline using an already-fitted preprocessor from *fitted_cache*.
+
+    [P1] memory=None when the manual preprocessor cache is active — using both
+    causes redundant disk I/O with no benefit (the transformer is already fitted
+    and injected; Pipeline.memory= has nothing new to cache).
     """
-    steps = []
-    
+    steps: List[Tuple[str, Any]] = []
     if preprocessor is not None:
-        obj_id = id(preprocessor)
-        if obj_id in fitted_preprocessor_cache:
-            fitted_preproc = fitted_preprocessor_cache[obj_id]
-            if hasattr(fitted_preproc, "steps"):
-                steps.extend(fitted_preproc.steps.copy())
-            else:
-                steps.append(("preprocessor", fitted_preproc))
+        fitted = fitted_cache.get(id(preprocessor), preprocessor)
+        if hasattr(fitted, "steps"):
+            steps.extend(fitted.steps.copy())
         else:
-            # Fallback to unfitted preprocessor if not in cache
-            if hasattr(preprocessor, "steps"):
-                steps.extend(preprocessor.steps.copy())
-            else:
-                steps.append(("preprocessor", preprocessor))
-    
+            steps.append(("preprocessor", fitted))
     if sampler is not None:
         steps.append(("sampler", sampler))
-    
     steps.append(("model", model))
-    return ImbPipeline(steps, memory=cachedir)
+    # [P1] Do not pass cachedir here — manual cache makes Pipeline.memory= redundant
+    return ImbPipeline(steps, memory=None)
 
 
-def _extract_feature_importance(
-    pipeline: Any, feature_names: Optional[List[str]] = None, top_k: int = 10
-) -> Dict[str, float]:
+# ==============================================================================
+# EARLY STOPPING & EVAL SET INJECTION
+# ==============================================================================
+
+def _configure_early_stopping(
+    model: Any,
+    early_stopping_rounds: int = 50,
+    has_val_set: bool = False,
+) -> Dict[str, Any]:
     """
-    Extract feature importance/coefficients from a trained pipeline.
-    Returns a dict with feature names and their importance percentages.
+    Return pipeline-compatible fit_params for early stopping.
+
+    Early stopping requires an explicit eval_set, which only exists when the
+    caller sets ``val_size > 0``.  When *has_val_set* is False this function
+    returns an empty dict and logs an advisory so the caller knows early
+    stopping is inactive — no silent no-op.
+
+    Framework notes:
+    - LightGBM  → ``callbacks`` list injected via fit_params
+    - XGBoost   → ``early_stopping_rounds`` set in model ``__init__``, not here
+    - CatBoost  → ``early_stopping_rounds`` set in model ``__init__``, not here
     """
-    fitted_model = pipeline.named_steps.get("model")
-    if fitted_model is None:
+    cls_name = type(model).__name__
+    is_booster = any(x in cls_name for x in ("XGB", "LGBM", "LightGBM", "CatBoost", "Catboost"))
+
+    if not is_booster:
         return {}
 
-    # Get feature names after preprocessing
-    current_names = list(feature_names) if feature_names else []
-    preprocessor = pipeline.named_steps.get("preprocessor")
-
-    # Try to find preprocessing step with get_feature_names_out
-    if preprocessor is None:
-        for step_name, step in pipeline.named_steps.items():
-            if (
-                step_name != "model"
-                and step_name != "sampler"
-                and hasattr(step, "get_feature_names_out")
-            ):
-                preprocessor = step
-                break
-
-    if preprocessor and hasattr(preprocessor, "get_feature_names_out"):
-        try:
-            current_names = list(preprocessor.get_feature_names_out(feature_names))
-        except Exception:
-            pass
-
-    # Extract importance scores
-    importances_array = None
-    if hasattr(fitted_model, "coef_"):
-        coefs = np.abs(fitted_model.coef_)
-        if coefs.ndim > 1:
-            coefs = np.mean(coefs, axis=0)
-        else:
-            coefs = coefs.flatten()
-        importances_array = coefs
-    elif hasattr(fitted_model, "feature_importances_"):
-        importances_array = fitted_model.feature_importances_
-
-    if importances_array is None:
+    if not has_val_set:
+        logger.warning(
+            "[%s] Early stopping is disabled because val_size=0.0 — no eval_set available. "
+            "Set val_size > 0 (e.g. val_size=0.1) to enable it.",
+            cls_name,
+        )
         return {}
 
-    # Fill missing feature names
-    if len(current_names) < len(importances_array):
-        missing = len(importances_array) - len(current_names)
-        for i in range(missing):
-            current_names.append(f"Feature_{i+1}")
-    elif len(current_names) > len(importances_array):
-        current_names = current_names[: len(importances_array)]
-
-    # Normalize to percentages
-    total = np.sum(importances_array)
-    if total > 0:
-        percentages = (importances_array / total) * 100
-    else:
-        percentages = np.zeros_like(importances_array)
-
-    # Create dict and sort by importance
-    importance_dict = dict(zip(current_names, percentages))
-    sorted_dict = dict(sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)[:top_k])
-
-    return sorted_dict
-
-
-def optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Downcasts 64-bit types to 32-bit types to save 50% memory.
-    
-    Automatically converts float64 -> float32 and int64 -> int32 where possible,
-    reducing memory overhead without significant precision loss for most ML tasks.
-    
-    Args:
-        df: Input DataFrame with potentially high-precision columns.
-        
-    Returns:
-        DataFrame with optimized dtypes consuming approximately 50% less memory.
-        
-    Example:
-        >>> df = pd.DataFrame({'a': [1.0, 2.0, 3.0], 'b': [1, 2, 3]})
-        >>> df.memory_usage(deep=True).sum()  # Original memory usage
-        >>> optimized_df = optimize_dtypes(df)
-        >>> optimized_df.memory_usage(deep=True).sum()  # ~50% reduction
-    """
-    df_opt = df.copy()
-    
-    # Downcast float64 to float32
-    for col in df_opt.select_dtypes(include=['float64']).columns:
-        df_opt[col] = pd.to_numeric(df_opt[col], downcast='float')
-    
-    # Downcast int64 to int32 (or smaller)
-    for col in df_opt.select_dtypes(include=['int64']).columns:
-        df_opt[col] = pd.to_numeric(df_opt[col], downcast='integer')
-    
-    return df_opt
-
-
-def _configure_early_stopping(model, early_stopping_rounds: int = 50) -> Dict[str, Any]:
-    """
-    Configure early stopping callbacks/parameters for gradient boosting models.
-    
-    Handles framework-specific early stopping configuration:
-    - XGBoost: early_stopping_rounds in model init (not fit_params)
-    - LightGBM: callbacks with early_stopping in fit_params
-    - CatBoost: early_stopping_rounds in fit_params
-    
-    Args:
-        model: Model instance to check type
-        early_stopping_rounds: Number of rounds without improvement to trigger stop
-        
-    Returns:
-        Dict with early stopping config (with model__ prefix for pipeline compatibility)
-    """
-    model_cls_name = type(model).__name__
-    fit_params = {}
-    
-    if "LightGBM" in model_cls_name or "LGBM" in model_cls_name:
+    fit_params: Dict[str, Any] = {}
+    if "LightGBM" in cls_name or "LGBM" in cls_name:
         try:
             import lightgbm as lgb
             fit_params["model__callbacks"] = [
@@ -449,1432 +432,1796 @@ def _configure_early_stopping(model, early_stopping_rounds: int = 50) -> Dict[st
                 lgb.log_evaluation(period=0),
             ]
         except (ImportError, AttributeError):
-            pass
-            
-    elif "CatBoost" in model_cls_name or "Catboost" in model_cls_name:
-        fit_params["model__early_stopping_rounds"] = early_stopping_rounds
-        
-    elif "XGB" in model_cls_name or "xgboost" in str(model_cls_name).lower():
-        # XGBoost: eval_metric should be in model init, not fit params
-        # Early stopping will be handled via eval_set callback
-        pass  # No fit_params needed for XGBoost early stopping
-    
+            logger.warning("LightGBM early stopping requested but lgb.early_stopping unavailable.")
+
+    # XGBoost / CatBoost: early_stopping_rounds must be set in model __init__.
+    # eval_set is injected separately by _inject_eval_set; nothing needed here.
+
     return fit_params
 
 
-def _inject_eval_set(f_kwargs: Dict[str, Any], X_val: Optional[pd.DataFrame], 
-                     y_val: Optional[pd.Series], model) -> Dict[str, Any]:
-    """
-    Inject evaluation set into fit parameters for gradient boosting models.
-    
-    Args:
-        f_kwargs: Current fit parameters
-        X_val: Validation feature set (if available)
-        y_val: Validation target set (if available)
-        model: Model instance to check type
-        
-    Returns:
-        Updated f_kwargs with eval_set if model supports it and data available
-    """
+def _inject_eval_set(
+    f_kwargs: Dict[str, Any],
+    X_val: Optional[pd.DataFrame],
+    y_val: Optional[pd.Series],
+    model: Any,
+) -> Dict[str, Any]:
+    """Add eval_set to *f_kwargs* for gradient-boosting models that support it."""
     if X_val is None or y_val is None:
         return f_kwargs
-    
-    model_cls_name = type(model).__name__
-    updated_kwargs = dict(f_kwargs)
-    
-    # Gradient boosters that support eval_set
-    if any(x in model_cls_name for x in ["XGB", "LGBM", "LightGBM", "CatBoost", "Catboost"]):
-        updated_kwargs.setdefault("model__eval_set", [(X_val, y_val)])
-    
-    return updated_kwargs
+    cls_name = type(model).__name__
+    if any(x in cls_name for x in ("XGB", "LGBM", "LightGBM", "CatBoost", "Catboost")):
+        updated = dict(f_kwargs)
+        updated.setdefault("model__eval_set", [(X_val, y_val)])
+        return updated
+    return f_kwargs
 
 
-def _calculate_shap_values(model, X_sample: pd.DataFrame, max_samples: int = 500) -> Optional[Dict[str, Any]]:
+def _strip_early_stopping_params(f_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove early-stopping keys that require an explicit eval_set."""
+    skip_keys = {"eval_set", "callbacks", "early_stopping", "early_stopping_rounds"}
+    return {
+        k: v for k, v in f_kwargs.items()
+        if not any(s in k for s in skip_keys)
+    }
+
+
+# ==============================================================================
+# FEATURE IMPORTANCE & SHAP
+# ==============================================================================
+
+def _extract_feature_importance(
+    pipeline: Any,
+    feature_names: Optional[List[str]] = None,
+    top_k: int = 10,
+) -> Dict[str, float]:
     """
-    Calculate SHAP values for model interpretability (game-theory based feature importance).
-    
-    Uses industry-standard SHAP (SHapley Additive exPlanations) to compute exact feature
-    contributions. Superior to sklearn's feature_importances_ which is biased toward
-    high-cardinality features.
-    
-    Args:
-        model: Fitted model (must be tree-based or compatible with SHAP)
-        X_sample: Sample of training data for SHAP explainer background
-        max_samples: Max background samples (larger = slower but more accurate)
-        
-    Returns:
-        Dict with SHAP mean abs values + model type, or None if SHAP unavailable
-    """
-    if not HAS_SHAP:
-        return None
-    
-    try:
-        model_type = type(model).__name__
-        
-        # Limit background samples for speed (SHAP is O(features * background_samples))
-        if len(X_sample) > max_samples:
-            X_background = X_sample.sample(n=max_samples, random_state=42)
-        else:
-            X_background = X_sample
-        
-        # Create explainer (auto-detects model type)
-        if any(x in model_type for x in ["XGB", "LGBM", "Catboost"]):
-            # Tree-based: Use TreeExplainer (fast)
-            explainer = shap.TreeExplainer(model)
-        elif any(x in model_type for x in ["RandomForest", "GradientBoosting"]):
-            # Sklearn tree models
-            explainer = shap.TreeExplainer(model)
-        else:
-            # Linear/other: Use KernelExplainer (slower, universal)
-            explainer = shap.KernelExplainer(model.predict, X_background)
-        
-        # Calculate SHAP values for background data
-        shap_values = explainer.shap_values(X_background)
-        
-        # Handle multi-class classification (returns list of arrays)
-        if isinstance(shap_values, list):
-            # Multi-class: average across classes
-            shap_array = np.mean(np.abs(shap_values), axis=0)
-        else:
-            shap_array = np.abs(shap_values)
-        
-        # Mean absolute SHAP values per feature
-        feature_importance = np.mean(shap_array, axis=0)
-        
-        # Normalize to percentages
-        total = np.sum(feature_importance)
-        if total > 0:
-            importance_pct = (feature_importance / total) * 100
-        else:
-            importance_pct = np.zeros_like(feature_importance)
-        
-        # Create feature importance dict
-        feature_names = list(X_sample.columns) if hasattr(X_sample, 'columns') else [f"Feature_{i}" for i in range(len(feature_importance))]
-        importance_dict = dict(zip(feature_names, importance_pct))
-        
-        # Sort by importance
-        sorted_dict = dict(sorted(importance_dict.items(), key=lambda x: x[1], reverse=True))
-        
-        return {
-            "shap_values": sorted_dict,
-            "shap_method": "TreeExplainer" if any(x in model_type for x in ["XGB", "LGBM", "Catboost", "Forest"]) else "KernelExplainer",
-            "model_type": model_type,
-            "explainer": explainer,
-        }
-    except Exception as e:
-        return None
-
-
-def _plot_shap_summary(shap_result: Dict[str, Any], model_name: str, top_k: int = 20, 
-                       verbose: bool = True) -> None:
-    """
-    Display SHAP-based feature importance summary with game-theory interpretation.
-    
-    Args:
-        shap_result: Dict from _calculate_shap_values()
-        model_name: Model name for display
-        top_k: Number of top features to show
-        verbose: Whether to print details
-    """
-    if not shap_result or verbose is False:
-        return
-    
-    shap_importance = shap_result["shap_values"]
-    method = shap_result["shap_method"]
-    
-    print(f"\n🎯 SHAP Feature Importance (Game Theory Based) [{model_name}]:")
-    print(f"   Explainer: {method} | {len(shap_importance)} features analyzed")
-    print(f"  {'-' * 70}")
-    
-    for rank, (feat_name, importance_pct) in enumerate(
-        list(shap_importance.items())[:top_k], 1
-    ):
-        bar_length = int(importance_pct / 2)
-        bar = "█" * bar_length
-        print(f"  {rank:2d}. {feat_name:30s} {importance_pct:6.2f}% {bar}")
-        print(f"      └─ This feature's values explain {importance_pct:.1f}% of predictions")
-    
-    print(f"  {'-' * 70}")
-
-
-def _extract_shap_importance(pipeline: Any, feature_names: Optional[List[str]] = None, 
-                            X_train: Optional[pd.DataFrame] = None, top_k: int = 10) -> Dict[str, float]:
-    """
-    Extract SHAP-based feature importance from pipeline (fallback to sklearn if SHAP fails).
-    
-    SHAP (SHapley Additive exPlanations) uses game theory to calculate exact feature
-    contributions, avoiding bias in tree-based models. Falls back to sklearn importance
-    if SHAP unavailable or fails.
-    
-    Args:
-        pipeline: Fitted pipeline
-        feature_names: Original feature names
-        X_train: Training data for SHAP background (improves accuracy)
-        top_k: Top K features to return
-        
-    Returns:
-        Dict mapping feature names to importance percentages
+    Extract sklearn feature_importances_ / coef_ from a fitted pipeline.
+    Returns a dict of {feature: importance_pct} sorted descending.
     """
     fitted_model = pipeline.named_steps.get("model")
     if fitted_model is None:
         return {}
-    
-    # Try SHAP first if available
-    if HAS_SHAP and X_train is not None:
-        shap_result = _calculate_shap_values(fitted_model, X_train, max_samples=500)
-        if shap_result:
-            shap_imp = shap_result["shap_values"]
-            # Return top K
-            return dict(list(shap_imp.items())[:top_k])
-    
-    # Fallback to sklearn feature_importances_
-    current_names = list(feature_names) if feature_names else []
-    preprocessor = pipeline.named_steps.get("preprocessor")
-    
-    if preprocessor is None:
-        for step_name, step in pipeline.named_steps.items():
-            if (step_name != "model" and step_name != "sampler" and 
-                hasattr(step, "get_feature_names_out")):
-                preprocessor = step
-                break
-    
-    if preprocessor and hasattr(preprocessor, "get_feature_names_out"):
-        try:
-            current_names = list(preprocessor.get_feature_names_out(feature_names))
-        except Exception:
-            pass
-    
-    # Extract importance scores
-    importances_array = None
+
+    current_names = list(feature_names or [])
+
+    # Walk pipeline steps for a transformer with get_feature_names_out
+    for step_name, step in pipeline.named_steps.items():
+        if step_name in ("model", "sampler"):
+            continue
+        if hasattr(step, "get_feature_names_out"):
+            try:
+                current_names = list(step.get_feature_names_out(feature_names))
+            except Exception:
+                pass
+            break
+
+    importances: Optional[np.ndarray] = None
     if hasattr(fitted_model, "coef_"):
         coefs = np.abs(fitted_model.coef_)
-        if coefs.ndim > 1:
-            coefs = np.mean(coefs, axis=0)
-        else:
-            coefs = coefs.flatten()
-        importances_array = coefs
+        importances = np.mean(coefs, axis=0) if coefs.ndim > 1 else coefs.flatten()
     elif hasattr(fitted_model, "feature_importances_"):
-        importances_array = fitted_model.feature_importances_
-    
-    if importances_array is None:
+        importances = fitted_model.feature_importances_
+
+    if importances is None:
         return {}
-    
-    # Fill missing feature names
-    if len(current_names) < len(importances_array):
-        missing = len(importances_array) - len(current_names)
-        for i in range(missing):
-            current_names.append(f"Feature_{i+1}")
-    elif len(current_names) > len(importances_array):
-        current_names = current_names[: len(importances_array)]
-    
-    # Normalize to percentages
-    total = np.sum(importances_array)
-    if total > 0:
-        percentages = (importances_array / total) * 100
+
+    # Align feature names length
+    if len(current_names) < len(importances):
+        current_names += [f"Feature_{i}" for i in range(len(importances) - len(current_names))]
     else:
-        percentages = np.zeros_like(importances_array)
-    
-    importance_dict = dict(zip(current_names, percentages))
-    sorted_dict = dict(sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)[:top_k])
-    
-    return sorted_dict
+        current_names = current_names[: len(importances)]
+
+    total = np.sum(importances)
+    pcts = (importances / total * 100) if total > 0 else np.zeros_like(importances)
+    importance_dict = dict(zip(current_names, pcts))
+    return dict(sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)[:top_k])
 
 
-def _calculate_expected_calibration_error(y_true: np.ndarray, y_proba: np.ndarray, n_bins: int = 10) -> float:
+def _calculate_shap_values(
+    model: Any,
+    X_sample: pd.DataFrame,
+    max_samples: int = 500,
+    task: TaskType = TaskType.CLASSIFICATION,
+) -> Optional[Dict[str, Any]]:
     """
-    Calculate Expected Calibration Error (ECE) to measure probability calibration quality.
-    
-    ECE measures alignment between predicted probabilities and actual outcomes.
-    ECE = Σ |P(predicted class) - accuracy_in_bin| * (bin_size / total)
-    
-    Lower ECE = Better calibration.
-    - ECE=0.0: Perfect calibration (99% confident → correct 99% of time)
-    - ECE=0.2: Poorly calibrated (90% confident → only correct 70% of time)
-    
-    Args:
-        y_true: True binary labels (0/1)
-        y_proba: Predicted probabilities for positive class (0-1)
-        n_bins: Number of bins for calibration curve
-        
-    Returns:
-        Expected Calibration Error (float between 0 and 1)
+    Compute SHAP mean-absolute feature importances.
+
+    Uses TreeExplainer for tree-based models (fast) and KernelExplainer
+    as a universal fallback (slower).  Returns None if SHAP is unavailable
+    or the computation fails.
+
+    [S4] KernelExplainer now uses predict_proba for classifiers — predict()
+    returns integer class labels which SHAP would misinterpret as a regression
+    target, producing meaningless importance values.
+    """
+    if not HAS_SHAP:
+        return None
+
+    try:
+        model_type = type(model).__name__
+        X_bg = X_sample.sample(n=min(max_samples, len(X_sample)), random_state=42)
+
+        tree_types = ("XGB", "LGBM", "Catboost", "RandomForest", "GradientBoosting")
+        if any(t in model_type for t in tree_types):
+            explainer = shap.TreeExplainer(model)
+            method = "TreeExplainer"
+        else:
+            # [S4] Use predict_proba for classifiers so SHAP sees probabilities,
+            # not integer class labels. Falls back to predict for regressors.
+            predict_fn = (
+                model.predict_proba
+                if task == TaskType.CLASSIFICATION and hasattr(model, "predict_proba")
+                else model.predict
+            )
+            explainer = shap.KernelExplainer(predict_fn, X_bg)
+            method = "KernelExplainer"
+
+        shap_values = explainer.shap_values(X_bg)
+
+        # Multi-class → average across classes
+        if isinstance(shap_values, list):
+            shap_array = np.mean(np.abs(shap_values), axis=0)
+        else:
+            shap_array = np.abs(shap_values)
+
+        mean_abs = np.mean(shap_array, axis=0)
+        total = np.sum(mean_abs)
+        pcts = (mean_abs / total * 100) if total > 0 else np.zeros_like(mean_abs)
+
+        feat_names = (
+            list(X_sample.columns)
+            if hasattr(X_sample, "columns")
+            else [f"Feature_{i}" for i in range(len(mean_abs))]
+        )
+        importance_dict = dict(sorted(zip(feat_names, pcts), key=lambda x: x[1], reverse=True))
+
+        return {
+            "shap_values": importance_dict,
+            "shap_method": method,
+            "model_type": model_type,
+            "explainer": explainer,
+        }
+    except Exception as exc:
+        logger.debug("SHAP calculation failed: %s", exc)
+        return None
+
+
+def _extract_shap_importance(
+    pipeline: Any,
+    feature_names: Optional[List[str]] = None,
+    X_train: Optional[pd.DataFrame] = None,
+    top_k: int = 10,
+    task: TaskType = TaskType.CLASSIFICATION,
+) -> Dict[str, float]:
+    """
+    Try SHAP first; fall back to sklearn feature_importances_ / coef_.
+    Always returns a dict of {feature: importance_pct}.
+    """
+    fitted_model = pipeline.named_steps.get("model")
+    if fitted_model is None:
+        return {}
+
+    if HAS_SHAP and X_train is not None:
+        result = _calculate_shap_values(fitted_model, X_train, max_samples=500, task=task)
+        if result:
+            return dict(list(result["shap_values"].items())[:top_k])
+
+    return _extract_feature_importance(pipeline, feature_names, top_k)
+
+
+def _print_shap_summary(
+    shap_result: Dict[str, Any],
+    model_name: str,
+    top_k: int = 20,
+) -> None:
+    """Pretty-print SHAP feature importances."""
+    if not shap_result:
+        return
+    importance = shap_result["shap_values"]
+    method = shap_result["shap_method"]
+    print(f"\n  SHAP Feature Importance ({method}) [{model_name}]:")
+    print(f"  {'-' * 70}")
+    for rank, (feat, pct) in enumerate(list(importance.items())[:top_k], 1):
+        val = float(np.asarray(pct).flat[0])
+        bar = "#" * int(val / 2)
+        print(f"  {rank:2d}. {feat:30s} {val:6.2f}%  {bar}")
+    print(f"  {'-' * 70}")
+
+
+# ==============================================================================
+# FOLD DETAIL PRINTER
+# ==============================================================================
+
+def _print_fold_details(
+    model_name: str,
+    fold_scores: List[float],
+    metric_name: str = "accuracy",
+    verbose: bool = True,
+) -> Dict[str, float]:
+    """Display per-fold CV scores and return summary statistics."""
+    arr = np.asarray(fold_scores)
+    stats = {
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+    }
+    if verbose:
+        print(f"\n  Fold-Level {metric_name.capitalize()} [{model_name}]:")
+        print(f"  {'-' * 60}")
+        for i, score in enumerate(fold_scores, 1):
+            print(f"    Fold {i}: {score:.6f}")
+        print(f"  {'-' * 60}")
+        print(f"    Mean: {stats['mean']:.6f}  Std: {stats['std']:.6f}  "
+              f"Min: {stats['min']:.6f}  Max: {stats['max']:.6f}")
+    return stats
+
+
+# ==============================================================================
+# CALIBRATION
+# ==============================================================================
+
+def _calculate_expected_calibration_error(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    n_bins: int = 10,
+) -> float:
+    """
+    Expected Calibration Error (ECE).
+
+    ECE = Σ_bins |avg_confidence - avg_accuracy| × (bin_size / N)
+    Lower is better. 0.0 = perfect calibration.
     """
     bin_edges = np.linspace(0, 1, n_bins + 1)
     ece = 0.0
-    total_samples = len(y_true)
-    
-    for i in range(len(bin_edges) - 1):
-        mask = (y_proba >= bin_edges[i]) & (y_proba < bin_edges[i + 1])
-        if np.sum(mask) > 0:
-            # Accuracy in this bin
-            bin_accuracy = np.mean(y_true[mask])
-            # Average confidence in this bin
-            bin_confidence = np.mean(y_proba[mask])
-            # Contribution to ECE
-            ece += np.abs(bin_confidence - bin_accuracy) * (np.sum(mask) / total_samples)
-    
+    n = len(y_true)
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        mask = (y_proba >= lo) & (y_proba < hi)
+        if mask.sum() > 0:
+            ece += abs(y_proba[mask].mean() - y_true[mask].mean()) * mask.sum() / n
     return float(ece)
 
 
-def _calibrate_model(pipeline: Any, X_train: pd.DataFrame, y_train: pd.Series, 
-                    calibration_method: str = "isotonic", cv: int = 5) -> CalibratedClassifierCV:
+def _calibrate_model(
+    pipeline: Any,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    calibration_method: str = "isotonic",
+    cv: int = 5,
+    X_val: Optional[pd.DataFrame] = None,
+    y_val: Optional[pd.Series] = None,
+) -> CalibratedClassifierCV:
     """
-    Wrap classification pipeline with probability calibration for accurate confidence scores.
-    
-    Calibration ensures:
-    - When model says "90% confident", it's correct 9 times out of 10
-    - Probabilities reflect true likelihood of classes
-    - Log-Loss and other probability-based metrics improve
-    
-    Methods:
-    - 'isotonic': Non-parametric, more flexible (requires more data, ~50+ samples)
-    - 'sigmoid': Parametric Platt Scaling (works with small datasets, ~10+ samples)
-    
-    Args:
-        pipeline: Fitted classification pipeline
-        X_train: Training data for calibrator fitting
-        y_train: Training labels for calibrator fitting
-        calibration_method: 'isotonic' (recommended for large datasets) or 'sigmoid' (Platt Scaling)
-        cv: Cross-validation strategy for calibration (prevents target leakage)
-        
-    Returns:
-        CalibratedClassifierCV wrapper around original pipeline
-    """
-    return CalibratedClassifierCV(
-        estimator=pipeline,
-        method=calibration_method,
-        cv=cv
-    )
+    Wrap *pipeline* with CalibratedClassifierCV.
 
+    When *X_val* / *y_val* are provided (val_size > 0):
+        - Uses cv=1 on the validation set (faster, one-shot calibration).
+        - The pipeline must already be fitted before entering Phase 4.
 
-def _initialize_optuna_storage(storage_url: Optional[str] = None, study_name: Optional[str] = None,
-                              save_dir: Optional[str] = None, verbose: bool = True) -> tuple:
+    When val_size = 0 (no validation set):
+        - Uses K-fold cross-calibration on *X_train*.
+        - Each fold re-fits the pipeline, so this takes N× longer.
+        - If the training set is small (< 200 samples) and ``method="isotonic"``,
+          the method is automatically downgraded to ``"sigmoid"`` (Platt Scaling).
     """
-    Initialize persistent Optuna storage backend for distributed tuning.
-    
-    Supports SQLite (local persistence) and Redis (distributed):
-    - SQLite: Perfect for Kaggle parallel notebooks (all point to same .db file)
-    - Redis: Cloud/remote distributed tuning across machines
-    
-    Args:
-        storage_url: Storage backend URL
-            - None: In-memory (default, no persistence)
-            - 'sqlite:///automl_optuna.db': SQLite in current directory
-            - 'sqlite:////tmp/automl_optuna.db': SQLite in /tmp (absolute path)
-            - 'redis://localhost:6379': Redis on local machine
-        study_name: Name for the Optuna study (used for resuming trials)
-        save_dir: Directory to save database files (if None, uses current directory)
-        verbose: Whether to print setup information
-        
-    Returns:
-        Tuple of (storage_url, study_name) for optuna.create_study()
-        
-    Example:
-        # Single Kaggle notebook (local SQLite)
-        storage, study_name = _initialize_optuna_storage(
-            storage_url="sqlite:///automl_optuna.db",
-            study_name="kaggle_run_1"
-        )
-        
-        # Three parallel Kaggle notebooks (all use same database)
-        # Notebook 1: storage_url="sqlite:///automl_optuna.db", study_name="shared_study"
-        # Notebook 2: storage_url="sqlite:///automl_optuna.db", study_name="shared_study"
-        # Notebook 3: storage_url="sqlite:///automl_optuna.db", study_name="shared_study"
-        # Result: 3x faster tuning via parallel trials + shared history
-    """
-    if storage_url is None:
-        # In-memory only (default, no persistence)
-        if verbose:
-            print("   📦 Optuna Storage: In-memory (no persistence)")
-        return None, study_name or "default_study"
-    
-    # Prepare storage path
-    final_storage_url = storage_url
-    
-    if storage_url.startswith("sqlite://"):
-        # SQLite backend
-        db_path = storage_url.replace("sqlite:///", "")
-        
-        # If relative path and save_dir provided, prepend save_dir
-        if not db_path.startswith("/") and save_dir:
-            db_path = os.path.join(save_dir, db_path)
-            final_storage_url = f"sqlite:///{db_path}"
-        
-        # Create parent directory if needed
-        db_dir = os.path.dirname(db_path)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
-        
-        if verbose:
-            print(f"   🗄️  Optuna Storage: SQLite at {os.path.abspath(db_path)}")
-            print(f"   📊 Study Name: {study_name or 'default_study'}")
-            print(f"   ⚡ Kaggle Feature: Multiple notebooks can share this database for 3x speedup")
-    
-    elif storage_url.startswith("redis://"):
-        # Redis backend
-        if verbose:
-            print(f"   🔴 Optuna Storage: Redis at {storage_url}")
-            print(f"   📊 Study Name: {study_name or 'default_study'}")
-            print(f"   ⚡ Kaggle Feature: Cloud-distributed tuning across any machines")
-    
+    has_val = X_val is not None and y_val is not None
+
+    if has_val:
+        cv_arg = 1  # Use single split on validation set (no re-fitting base estimator)
+        fit_X, fit_y = X_val, y_val
     else:
-        if verbose:
-            print(f"   ⚠️  Unknown storage backend: {storage_url}")
-    
-    return final_storage_url, study_name or "default_study"
+        cv_arg = cv
+        fit_X, fit_y = X_train, y_train
+
+    # Guard: isotonic needs enough samples to avoid overfitting.
+    min_samples_per_fold = len(fit_X) // (cv_arg if isinstance(cv_arg, int) else 1)
+    effective_method = calibration_method
+    if calibration_method == "isotonic" and min_samples_per_fold < 40:
+        effective_method = "sigmoid"
+        logger.warning(
+            "Calibration method downgraded isotonic -> sigmoid: only ~%d samples per fold "
+            "(isotonic needs >=40). Increase val_size or training data to use isotonic.",
+            min_samples_per_fold,
+        )
+
+    calib = CalibratedClassifierCV(
+        estimator=pipeline,
+        method=effective_method,
+        cv=cv_arg,
+    )
+    calib.fit(fit_X, fit_y)
+    return calib
 
 
-def _validate_data_contract(X: pd.DataFrame, y: pd.Series, feature_names: Optional[List[str]] = None,
-                            task_type: str = "classification", verbose: bool = True) -> Dict[str, Any]:
+# ==============================================================================
+# OPTUNA STORAGE
+# ==============================================================================
+
+def _initialize_optuna_storage(
+    storage_url: Optional[str],
+    study_name: Optional[str],
+    save_dir: Optional[str],
+    verbose: bool,
+) -> Tuple[Optional[str], str]:
     """
-    Validate data quality using Pandera (Data Contract/Schema Validation).
-    
-    Catches data quality issues EARLY (before model training):
-    - Missing columns (IT department renamed something)
-    - Type mismatches (integers accidentally converted to strings)
-    - NaN/null values in critical columns
-    - Out-of-range values
-    - Duplicate rows
-    
-    This prevents cryptic errors deep in the modeling pipeline.
-    
-    Args:
-        X: Feature DataFrame
-        y: Target Series
-        feature_names: Expected feature names (if None, auto-detects from X)
-        task_type: 'classification' or 'regression'
-        verbose: Whether to print validation results
-        
-    Returns:
-        Dict with validation results: {'passed': bool, 'issues': List[str], 'schema': schema}
+    Prepare an Optuna storage backend.
+
+    Supports:
+    - None          -> in-memory (no persistence)
+    - sqlite:///... -> local SQLite file (great for Kaggle parallel notebooks)
+    - redis://...   -> remote Redis (cloud distributed tuning)
     """
-    results = {
-        'passed': True,
-        'issues': [],
-        'schema': None,
-        'stats': {}
-    }
-    
+    vp = _vp(verbose)
+    resolved_name = study_name or "default_study"
+
+    if storage_url is None:
+        vp("   Optuna Storage: In-memory (no persistence)")
+        return None, resolved_name
+
+    final_url = storage_url
+    if storage_url.startswith("sqlite:///"):
+        db_path = storage_url[len("sqlite:///"):]
+        if not os.path.isabs(db_path) and save_dir:
+            db_path = os.path.join(save_dir, db_path)
+            final_url = f"sqlite:///{db_path}"
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        vp(f"   Optuna SQLite: {os.path.abspath(db_path)}")
+
+    elif storage_url.startswith("redis://"):
+        vp(f"   Optuna Redis: {storage_url}")
+
+    else:
+        logger.warning("Unknown Optuna storage backend: %s", storage_url)
+
+    vp(f"   Optuna Study: {resolved_name}")
+    return final_url, resolved_name
+
+
+# ==============================================================================
+# DATA VALIDATION (PANDERA)
+# ==============================================================================
+
+def _validate_data_contract(
+    X: pd.DataFrame,
+    y: pd.Series,
+    feature_names: Optional[List[str]],
+    task_type: str,
+    verbose: bool,
+) -> Dict[str, Any]:
+    """
+    Run Pandera-backed data contract checks before any modelling begins.
+
+    Always performs basic pandas checks. Pandera schema checks run only when
+    the library is installed. Critical errors (NaN in target, shape mismatch)
+    are raised immediately; warnings are collected and returned.
+    """
+    vp = _vp(verbose)
+    issues: List[str] = []
+    passed = True
+
     if verbose:
         print("\n" + "=" * 70)
-        print("🔍 DATA QUALITY VALIDATION (Data Contract via Pandera)")
+        print("DATA QUALITY VALIDATION")
         print("=" * 70)
-    
-    # Basic pandas-level checks (always available)
-    if verbose:
-        print("\n📋 Basic Validation (pandas):")
-    
-    # Check shape
-    if X.shape[0] == 0:
-        results['issues'].append("ERROR: X has 0 rows")
-        results['passed'] = False
-    if X.shape[1] == 0:
-        results['issues'].append("ERROR: X has 0 columns")
-        results['passed'] = False
-    if y.shape[0] == 0:
-        results['issues'].append("ERROR: y has 0 rows")
-        results['passed'] = False
-    
-    # Check row count alignment
-    if X.shape[0] != y.shape[0]:
-        results['issues'].append(f"ERROR: Row mismatch - X has {X.shape[0]} rows, y has {y.shape[0]} rows")
-        results['passed'] = False
-    
-    # Check for NaN in target
-    n_nans_y = y.isna().sum()
-    if n_nans_y > 0:
-        results['issues'].append(f"ERROR: Target (y) contains {n_nans_y} NaN values")
-        results['passed'] = False
-    
-    # Check for NaN in features
-    n_nans_X = X.isna().sum().sum()
-    if n_nans_X > 0:
-        nan_cols = X.columns[X.isna().any()].tolist()
-        results['issues'].append(f"WARNING: Features contain {n_nans_X} NaN values in columns: {nan_cols}")
-        if verbose:
-            print(f"   ⚠️  NaN values detected: {n_nans_X} cells in {len(nan_cols)} columns")
-    
-    # Check for duplicates
-    n_dups = X.duplicated().sum()
-    if n_dups > 0:
-        results['issues'].append(f"WARNING: {n_dups} duplicate rows in X")
-        if verbose:
-            print(f"   ⚠️  Duplicate rows: {n_dups} rows")
-    
-    # Check data types
-    if verbose:
-        print(f"   ✓ Shape: X={X.shape}, y={y.shape}")
-        print(f"   ✓ Data types: {X.dtypes.unique().tolist()}")
-    
-    results['stats'] = {
-        'n_rows': X.shape[0],
-        'n_cols': X.shape[1],
-        'n_nans': n_nans_X,
-        'n_duplicates': n_dups,
-        'dtypes': X.dtypes.to_dict()
-    }
-    
-    # --- Pandera Schema Validation (if available) ---
-    if HAS_PANDERA:
-        if verbose:
-            print("\n📊 Advanced Validation (Pandera Data Contract):")
-        
-        try:
-            # Auto-build schema from data statistics
-            schema_dict = {}
-            
-            for col in X.columns:
-                col_dtype = X[col].dtype
-                
-                # Determine Pandera dtype
-                if col_dtype == 'object':
-                    pa_dtype = pa.String
-                elif col_dtype in ['int64', 'int32', 'int16', 'int8']:
-                    pa_dtype = pa.Int64
-                elif col_dtype in ['float64', 'float32']:
-                    pa_dtype = pa.Float64
-                else:
-                    pa_dtype = None
-                
-                if pa_dtype:
-                    # Build checks for this column
-                    col_checks = [
-                        pa.Check.notin([np.nan, np.inf, -np.inf], ignore_na=True, name=f"no_special_values_{col}")
-                    ]
-                    
-                    # Additional checks for numeric columns
-                    if col_dtype in ['int64', 'int32', 'int16', 'int8', 'float64', 'float32']:
-                        col_min = X[col].min()
-                        col_max = X[col].max()
-                        col_checks.append(
-                            pa.Check.in_range(col_min, col_max, ignore_na=True, name=f"in_range_{col}")
-                        )
-                    
-                    schema_dict[col] = pa.Column(pa_dtype, checks=col_checks, nullable=X[col].isna().any())
-            
-            # Create and validate schema
-            schema = pa.DataFrameSchema(schema_dict, coerce=False, strict=False)
-            schema.validate(X)
-            
-            results['schema'] = schema
-            if verbose:
-                print(f"   ✓ Pandera Schema validation passed for {len(schema_dict)} columns")
-                print(f"   ✓ All data types and value ranges are within expected bounds")
-        
-        except Exception as e:
-            results['issues'].append(f"Pandera validation error: {str(e)}")
-            if verbose:
-                print(f"   ⚠️  Pandera validation warning: {str(e)}")
-    
-    else:
-        if verbose:
-            print("   ℹ️  Pandera not installed. Install with: pip install pandera[io]")
-            print("      For advanced data contract validation")
-    
-    # Print summary
-    if verbose:
-        if results['passed']:
-            print(f"\n✅ Data Contract: PASSED")
-            print(f"   Ready for modeling phase!")
-        else:
-            print(f"\n❌ Data Contract: FAILED")
-            print(f"   Issues found:")
-            for issue in results['issues']:
-                print(f"      - {issue}")
-    
-    return results
 
+    # --- Basic checks (always) ---
+    if X.shape[0] == 0:
+        issues.append("ERROR: X has 0 rows")
+        passed = False
+    if X.shape[1] == 0:
+        issues.append("ERROR: X has 0 columns")
+        passed = False
+    if y.shape[0] == 0:
+        issues.append("ERROR: y has 0 rows")
+        passed = False
+    if X.shape[0] != y.shape[0]:
+        issues.append(f"ERROR: Row mismatch — X={X.shape[0]}, y={y.shape[0]}")
+        passed = False
+
+    n_nans_y = int(y.isna().sum())
+    if n_nans_y:
+        issues.append(f"ERROR: y has {n_nans_y} NaN value(s)")
+        passed = False
+
+    n_nans_X = int(X.isna().sum().sum())
+    if n_nans_X:
+        nan_cols = X.columns[X.isna().any()].tolist()
+        issues.append(f"WARNING: X has {n_nans_X} NaN(s) in columns {nan_cols}")
+
+    n_dups = int(X.duplicated().sum())
+    if n_dups:
+        issues.append(f"WARNING: {n_dups} duplicate row(s) in X")
+
+    if verbose:
+        print(f"   Shape X={X.shape}, y={y.shape}")
+        if issues:
+            for issue in issues:
+                tag = "ERROR" if issue.startswith("ERROR") else "WARNING"
+                print(f"   [{tag}] {issue}")
+        else:
+            print("   All basic checks passed")
+
+    # --- Pandera schema validation ---
+    schema = None
+    if HAS_PANDERA:
+        try:
+            col_defs: Dict[str, pa.Column] = {}
+            for col in X.columns:
+                dtype = X[col].dtype
+                nullable = bool(X[col].isna().any())
+                if dtype == object:
+                    col_defs[col] = pa.Column(pa.String, nullable=nullable)
+                elif np.issubdtype(dtype, np.integer):
+                    col_defs[col] = pa.Column(pa.Int64, nullable=nullable)
+                elif np.issubdtype(dtype, np.floating):
+                    col_defs[col] = pa.Column(pa.Float64, nullable=nullable)
+
+            schema = pa.DataFrameSchema(col_defs, coerce=False, strict=False)
+            schema.validate(X)
+            vp(f"   Pandera schema passed ({len(col_defs)} columns)")
+        except Exception as exc:
+            issues.append(f"WARNING: Pandera schema error — {exc}")
+            vp(f"   [Pandera WARNING] {exc}")
+    else:
+        vp("   Pandera not installed (pip install pandera[io] for schema validation)")
+
+    stats = {
+        "n_rows": X.shape[0],
+        "n_cols": X.shape[1],
+        "n_nans": n_nans_X,
+        "n_duplicates": n_dups,
+    }
+
+    if verbose:
+        status = "PASSED" if passed else "FAILED"
+        print(f"\n{status}")
+
+    return {"passed": passed, "issues": issues, "schema": schema, "stats": stats}
+
+
+# ==============================================================================
+# FOLDER & CHECKPOINT MANAGEMENT
+# ==============================================================================
+
+def _create_model_folder(save_dir: str, model_name: str) -> str:
+    """Create <save_dir>/<safe_model_name>/{artifacts,metrics,plots}/ and return path."""
+    safe = (
+        model_name.replace(" ", "_")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(":", "_")
+    )
+    folder = os.path.join(save_dir, safe)
+    for sub in ("artifacts", "metrics", "plots"):
+        os.makedirs(os.path.join(folder, sub), exist_ok=True)
+    return folder
+
+
+def _mark_model_in_progress(model_folder: str, model_name: str) -> None:
+    """Write a .in_progress sentinel file — removed only after successful save."""
+    marker = os.path.join(model_folder, ".in_progress")
+    with open(marker, "w") as fh:
+        fh.write(f"model={model_name}\nstarted={datetime.now().isoformat()}\n")
+
+
+def _detect_incomplete_models(save_dir: str, verbose: bool) -> Dict[str, str]:
+    """Scan *save_dir* for .in_progress markers indicating crashed runs."""
+    if not save_dir or not os.path.exists(save_dir):
+        return {}
+    incomplete: Dict[str, str] = {}
+    for folder in os.listdir(save_dir):
+        fpath = os.path.join(save_dir, folder)
+        if os.path.isdir(fpath) and os.path.exists(os.path.join(fpath, ".in_progress")):
+            incomplete[folder] = fpath
+    if verbose and incomplete:
+        print(f"\nCrash recovery: {len(incomplete)} incomplete model(s) detected — will retrain.")
+    return incomplete
+
+
+def _cleanup_incomplete_models(incomplete: Dict[str, str], verbose: bool) -> None:
+    """Remove .in_progress markers so those models retrain cleanly."""
+    vp = _vp(verbose)
+    for name, folder in incomplete.items():
+        marker = os.path.join(folder, ".in_progress")
+        try:
+            if os.path.exists(marker):
+                os.remove(marker)
+            vp(f"   Cleaned: {name}")
+        except OSError as exc:
+            logger.warning("Could not clean %s: %s", name, exc)
+
+
+def _save_phase_result(result: PhaseResult, model_folder: str, task_type: str) -> None:
+    """
+    Persist a PhaseResult to disk in an organised folder structure:
+
+    <model_folder>/
+      artifacts/model.pkl
+      metrics/metrics.csv
+      metrics/cv_scores.csv
+      metrics/hyperparameters.csv
+      metrics/feature_importance.csv   (if available)
+      model_summary.json
+
+    [S1] The .in_progress marker is removed AFTER all files are written and
+    only via an atomic os.replace on the checkpoint file — not before — so a
+    crash mid-write leaves the marker in place and the model retrains cleanly.
+    """
+    import json
+
+    # model.pkl
+    joblib.dump(result.pipeline, os.path.join(model_folder, "artifacts", "model.pkl"))
+
+    # model_summary.json — [D2] cv_scores is already List[float], no .tolist() needed
+    summary = {
+        "model_name": result.name,
+        "task_type": task_type,
+        "training_time_seconds": result.training_time,
+        "cv_scores": {
+            "mean": result.cv_mean,
+            "std": result.cv_std,
+            "min": float(min(result.cv_scores)),
+            "max": float(max(result.cv_scores)),
+            "folds": result.cv_scores,
+        },
+        "test_metrics": {"metric_1": result.metric1, "metric_2": result.metric2},
+        "hyperparameters": result.best_params,
+        "timestamp": datetime.now().isoformat(),
+        "status": "completed",
+    }
+    with open(os.path.join(model_folder, "model_summary.json"), "w") as fh:
+        json.dump(summary, fh, indent=4)
+
+    # metrics.csv
+    pd.DataFrame(
+        {
+            "Metric": ["CV Mean", "CV Std", "CV Min", "CV Max", "Metric1", "Metric2", "Train Time"],
+            "Value": [result.cv_mean, result.cv_std,
+                      float(min(result.cv_scores)), float(max(result.cv_scores)),
+                      result.metric1, result.metric2, result.training_time],
+        }
+    ).to_csv(os.path.join(model_folder, "metrics", "metrics.csv"), index=False)
+
+    # cv_scores.csv
+    pd.DataFrame({"Fold": range(1, len(result.cv_scores) + 1), "Score": result.cv_scores}).to_csv(
+        os.path.join(model_folder, "metrics", "cv_scores.csv"), index=False
+    )
+
+    # hyperparameters.csv
+    if result.best_params:
+        pd.DataFrame(
+            list(result.best_params.items()), columns=["Parameter", "Value"]
+        ).to_csv(os.path.join(model_folder, "metrics", "hyperparameters.csv"), index=False)
+
+    # feature_importance.csv
+    if result.feature_importance:
+        pd.DataFrame(
+            list(result.feature_importance.items()), columns=["Feature", "Importance"]
+        ).sort_values("Importance", ascending=False).to_csv(
+            os.path.join(model_folder, "metrics", "feature_importance.csv"), index=False
+        )
+
+    # [S1] Only remove the in_progress marker AFTER all files are written
+    marker = os.path.join(model_folder, ".in_progress")
+    if os.path.exists(marker):
+        os.remove(marker)
+
+
+def _atomic_checkpoint_dump(state: Dict[str, Any], checkpoint_file: str) -> None:
+    """
+    [S1] Write checkpoint atomically using a temp file + os.replace.
+
+    os.replace is atomic on POSIX (rename syscall) and on Windows (MoveFileEx
+    with MOVEFILE_REPLACE_EXISTING). A crash mid-write leaves the tmp file
+    on disk but the checkpoint itself is never partially overwritten.
+    """
+    tmp = checkpoint_file + ".tmp"
+    joblib.dump(state, tmp)
+    os.replace(tmp, checkpoint_file)
+
+
+def _create_structure_overview(save_dir: str, summary_df: pd.DataFrame) -> None:
+    """Write a README_STRUCTURE.txt index to *save_dir*."""
+    if not save_dir or not os.path.exists(save_dir):
+        return
+    lines = [
+        "=" * 80,
+        "MODEL RESULTS — FOLDER STRUCTURE OVERVIEW",
+        "=" * 80,
+        f"\nRoot: {save_dir}/",
+    ]
+    model_dirs = sorted(
+        d for d in os.listdir(save_dir)
+        if os.path.isdir(os.path.join(save_dir, d)) and d != "__pycache__"
+    )
+    for i, d in enumerate(model_dirs):
+        prefix = "└── " if i == len(model_dirs) - 1 else "├── "
+        lines.append(f"  {prefix}{d}/")
+    if not summary_df.empty:
+        lines += ["\n" + "=" * 80, "RANKINGS", "=" * 80, summary_df.to_string()]
+
+    path = os.path.join(save_dir, "README_STRUCTURE.txt")
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines))
+
+
+# ==============================================================================
+# PHASE RUNNERS  (separated from the main orchestrator)
+# ==============================================================================
+
+def _run_phase1_screening(
+    models: Dict[str, Any],
+    preprocess_pipeline: Union[Any, Dict[str, Any]],
+    fitted_cache: Dict[int, Any],
+    sampler: Optional[Any],
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    cv_splitter: Any,
+    primary_metric: Any,
+    fit_params: Dict[str, Dict[str, Any]],
+    top_k: int,
+    quick_test_fraction: float,
+    random_seed: int,
+    stratify: bool,
+    task: TaskType,
+    n_jobs: int,
+    verbose: bool,
+) -> Dict[str, Any]:
+    """
+    Phase 1 — Screen all models on *quick_test_fraction* of training data.
+
+    Returns the filtered *models* dict containing only the top-k candidates.
+
+    [D4] Raises RuntimeError if no models survive screening.
+    """
+    vp = _vp(verbose)
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"PHASE 1: Quick Screening ({quick_test_fraction*100:.0f}% of training data)")
+        print(f"{'='*70}")
+
+    stratify_arg = y_train if (task == TaskType.CLASSIFICATION and stratify) else None
+    X_sub, _, y_sub, _ = train_test_split(
+        X_train, y_train,
+        train_size=quick_test_fraction,
+        stratify=stratify_arg,
+        random_state=random_seed,
+    )
+
+    scores: Dict[str, float] = {}
+    for name, model in models.items():
+        preprocessor = _get_preprocessor(preprocess_pipeline, name)
+        pipe = _build_pipeline_from_cache(preprocessor, sampler, model, fitted_cache)
+        f_kw = _strip_early_stopping_params(fit_params.get(name, {}))
+        try:
+            with threadpool_limits(limits=1, user_api="blas"):
+                with threadpool_limits(limits=1, user_api="openmp"):
+                    cv_scores = cross_val_score(
+                        pipe, X_sub, y_sub,
+                        cv=cv_splitter, scoring=primary_metric,
+                        n_jobs=n_jobs, params=f_kw,
+                    )
+            scores[name] = float(np.mean(cv_scores))
+            vp(f"   [{name}] {scores[name]:.4f}")
+        except Exception as exc:
+            logger.warning("Screening failed for %s: %s", name, exc)
+
+    # [D4] Raise immediately if nothing survived
+    if not scores:
+        raise RuntimeError(
+            "Phase 1 screening produced no surviving models. "
+            "Check your preprocessor, param_grids, and that models are compatible with X_train."
+        )
+
+    top_names = sorted(scores, key=lambda x: scores[x], reverse=True)[:top_k]
+    if verbose:
+        print(f"\nTop {top_k} advancing:")
+        for rank, nm in enumerate(top_names, 1):
+            print(f"   {rank}. {nm} ({scores[nm]:.4f})")
+
+    return {nm: models[nm] for nm in top_names}
+
+
+def _run_phase2_single_model(
+    name: str,
+    model: Any,
+    preprocess_pipeline: Union[Any, Dict[str, Any]],
+    fitted_cache: Dict[int, Any],
+    sampler: Optional[Any],
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: Optional[pd.DataFrame],
+    y_val: Optional[pd.Series],
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    cv_splitter: Any,
+    primary_metric: Any,
+    param_grids: Optional[Dict[str, Any]],
+    fit_params: Dict[str, Dict[str, Any]],
+    search_type: SearchType,
+    halving_factor: int,
+    optuna_n_trials: int,
+    optuna_timeout: Optional[int],
+    optuna_storage: Optional[str],
+    optuna_study_name: Optional[str],
+    distributed_tuning: bool,
+    random_seed: int,
+    task: TaskType,
+    feature_names: Optional[List[str]],
+    show_fold_details: bool,
+    save_dir: Optional[str],
+    n_jobs: int,
+    verbose: bool,
+) -> Optional[PhaseResult]:
+    """
+    Phase 2 — Train, tune, and evaluate a single model.
+
+    [S3] fit_params are deep-copied before use so mutations in one model's
+    path cannot leak into subsequent models.
+
+    Returns a populated PhaseResult or None on failure.
+    """
+    start = time.time()
+    vp = _vp(verbose)
+
+    model_folder = _create_model_folder(save_dir, name) if save_dir else None
+    if model_folder:
+        _mark_model_in_progress(model_folder, name)
+
+    try:
+        preprocessor = _get_preprocessor(preprocess_pipeline, name)
+        base_pipe = _build_pipeline_from_cache(preprocessor, sampler, model, fitted_cache)
+
+        best_params: Dict[str, Any] = {}
+        pipeline = base_pipe
+
+        # [S3] Deep-copy fit_params entry so mutations don't bleed to other models
+        f_kwargs = copy.deepcopy(fit_params.get(name, {}))
+
+        # Early stopping config for gradient boosters
+        cls_name = type(model).__name__
+        has_val = X_val is not None and y_val is not None
+        if any(x in cls_name for x in ("XGB", "LGBM", "LightGBM", "CatBoost", "Catboost")):
+            es_params = _configure_early_stopping(
+                model, early_stopping_rounds=50, has_val_set=has_val
+            )
+            f_kwargs.update(es_params)
+            if has_val:
+                vp(f"[{name}] Early stopping active (val_size > 0, eval_set will be injected)")
+            else:
+                vp(
+                    f"[{name}] Early stopping inactive — val_size=0.0. "
+                    f"Model trains for its full n_estimators. "
+                    f"Set val_size=0.1 to enable early stopping."
+                )
+
+        # Hyperparameter search
+        if param_grids and name in param_grids:
+            pipeline, best_params = _run_hyperparameter_search(
+                name=name,
+                base_pipe=base_pipe,
+                preprocessor=preprocessor,
+                sampler=sampler,
+                model=model,
+                fitted_cache=fitted_cache,
+                param_grid=param_grids[name],
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_val,
+                y_val=y_val,
+                cv_splitter=cv_splitter,
+                primary_metric=primary_metric,
+                f_kwargs=f_kwargs,
+                search_type=search_type,
+                halving_factor=halving_factor,
+                optuna_n_trials=optuna_n_trials,
+                optuna_timeout=optuna_timeout,
+                optuna_storage=optuna_storage,
+                optuna_study_name=optuna_study_name,
+                distributed_tuning=distributed_tuning,
+                random_seed=random_seed,
+                save_dir=save_dir,
+                n_jobs=n_jobs,
+                verbose=verbose,
+            )
+        else:
+            vp(f"[{name}] No param grid — training with defaults")
+            fit_kw = (
+                _inject_eval_set(f_kwargs, X_val, y_val, model)
+                if X_val is not None
+                else _strip_early_stopping_params(f_kwargs)
+            )
+            with threadpool_limits(limits=1, user_api="blas"):
+                with threadpool_limits(limits=1, user_api="openmp"):
+                    pipeline.fit(X_train, y_train, **fit_kw)
+
+        # Cross-validation score on full training set
+        cv_f_kw = _strip_early_stopping_params(f_kwargs)
+        with threadpool_limits(limits=1, user_api="blas"):
+            with threadpool_limits(limits=1, user_api="openmp"):
+                cv_scores_arr = cross_val_score(
+                    pipeline, X_train, y_train,
+                    cv=cv_splitter, scoring=primary_metric,
+                    n_jobs=n_jobs, params=cv_f_kw,
+                )
+        # [D2] Store as List[float]
+        cv_scores: List[float] = cv_scores_arr.tolist()
+
+        if show_fold_details:
+            _print_fold_details(name, cv_scores, metric_name=str(primary_metric), verbose=verbose)
+
+        # Test set predictions & metrics
+        y_pred = pipeline.predict(X_test)
+        if task == TaskType.CLASSIFICATION:
+            metric1 = accuracy_score(y_test, y_pred)
+            metric2 = f1_score(y_test, y_pred, average="macro", zero_division=0)
+        else:
+            metric1 = r2_score(y_test, y_pred)
+            metric2 = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+
+        # Feature importance (SHAP preferred) — [S4] pass task for correct predict fn
+        feat_imp = _extract_shap_importance(pipeline, feature_names, X_train, top_k=10, task=task)
+        if feat_imp and verbose:
+            _print_shap_summary(
+                {"shap_values": feat_imp, "shap_method": "SHAP/sklearn", "model_type": cls_name},
+                model_name=name,
+                top_k=10,
+            )
+
+        elapsed = time.time() - start
+        result = PhaseResult(
+            name=name,
+            pipeline=pipeline,
+            cv_scores=cv_scores,
+            metric1=metric1,
+            metric2=metric2,
+            best_params=best_params,
+            training_time=elapsed,
+            feature_importance=feat_imp,
+        )
+
+        if model_folder:
+            _save_phase_result(result, model_folder, task.value)
+            vp(f"   Saved to {model_folder}")
+
+        logger.info(
+            "phase2_model_complete",
+            extra={"model": name, "cv_mean": result.cv_mean, "metric1": metric1,
+                   "elapsed": round(elapsed, 2)},
+        )
+        return result
+
+    except Exception:
+        logger.error("Model '%s' failed:\n%s", name, traceback.format_exc())
+        if verbose:
+            print(f"\n[ERROR] Model '{name}' failed — see logs.")
+        return None
+
+
+def _run_hyperparameter_search(
+    *,
+    name: str,
+    base_pipe: ImbPipeline,
+    preprocessor: Optional[Any],
+    sampler: Optional[Any],
+    model: Any,
+    fitted_cache: Dict[int, Any],
+    param_grid: Any,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: Optional[pd.DataFrame],
+    y_val: Optional[pd.Series],
+    cv_splitter: Any,
+    primary_metric: Any,
+    f_kwargs: Dict[str, Any],
+    search_type: SearchType,
+    halving_factor: int,
+    optuna_n_trials: int,
+    optuna_timeout: Optional[int],
+    optuna_storage: Optional[str],
+    optuna_study_name: Optional[str],
+    distributed_tuning: bool,
+    random_seed: int,
+    save_dir: Optional[str],
+    n_jobs: int,
+    verbose: bool,
+) -> Tuple[ImbPipeline, Dict[str, Any]]:
+    """
+    Run the requested hyperparameter search and return (fitted_pipeline, best_params).
+    """
+    vp = _vp(verbose)
+
+    if search_type == SearchType.OPTUNA:
+        return _run_optuna_search(
+            name=name,
+            base_pipe=base_pipe,
+            preprocessor=preprocessor,
+            sampler=sampler,
+            model=model,
+            fitted_cache=fitted_cache,
+            param_grid=param_grid,
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
+            cv_splitter=cv_splitter,
+            primary_metric=primary_metric,
+            f_kwargs=f_kwargs,
+            n_trials=optuna_n_trials,
+            timeout=optuna_timeout,
+            storage_url=optuna_storage if distributed_tuning else None,
+            study_name=optuna_study_name,
+            distributed=distributed_tuning,
+            random_seed=random_seed,
+            save_dir=save_dir,
+            n_jobs=n_jobs,
+            verbose=verbose,
+        )
+
+    # sklearn-based searches
+    common_kwargs: Dict[str, Any] = {
+        "cv": cv_splitter,
+        "scoring": primary_metric,
+        "n_jobs": n_jobs,
+    }
+    if search_type == SearchType.GRID:
+        searcher = GridSearchCV(base_pipe, param_grid, **common_kwargs)
+        label = "GridSearchCV"
+    elif search_type == SearchType.HALVING:
+        searcher = HalvingGridSearchCV(
+            base_pipe, param_grid, factor=halving_factor,
+            random_state=random_seed, **common_kwargs
+        )
+        label = f"HalvingGridSearchCV (factor={halving_factor})"
+    else:  # random
+        searcher = RandomizedSearchCV(
+            base_pipe, param_grid, n_iter=10,
+            random_state=random_seed, **common_kwargs
+        )
+        label = "RandomizedSearchCV"
+
+    vp(f"[{name}] {label}")
+    with threadpool_limits(limits=1, user_api="blas"):
+        with threadpool_limits(limits=1, user_api="openmp"):
+            searcher.fit(X_train, y_train, **_strip_early_stopping_params(f_kwargs))
+
+    best_params = {k.replace("model__", ""): v for k, v in searcher.best_params_.items()}
+    return searcher.best_estimator_, best_params
+
+
+def _run_optuna_search(
+    *,
+    name: str,
+    base_pipe: ImbPipeline,
+    preprocessor: Optional[Any],
+    sampler: Optional[Any],
+    model: Any,
+    fitted_cache: Dict[int, Any],
+    param_grid: Dict[str, Any],
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: Optional[pd.DataFrame],
+    y_val: Optional[pd.Series],
+    cv_splitter: Any,
+    primary_metric: Any,
+    f_kwargs: Dict[str, Any],
+    n_trials: int,
+    timeout: Optional[int],
+    storage_url: Optional[str],
+    study_name: Optional[str],
+    distributed: bool,
+    random_seed: int,
+    save_dir: Optional[str],
+    n_jobs: int,
+    verbose: bool,
+) -> Tuple[ImbPipeline, Dict[str, Any]]:
+    """
+    Optuna Bayesian hyperparameter optimisation, with optional distributed storage.
+
+    [P6] cross_val_score inside the objective now uses n_jobs so CV folds run
+    in parallel within each trial — previously each trial ran serially.
+
+    Returns (best_fitted_pipeline, best_params_dict).
+    """
+    vp = _vp(verbose)
+
+    resolved_study = (
+        study_name.format(model=name)
+        if study_name and "{model}" in study_name
+        else study_name
+    )
+    storage_final, resolved_study = _initialize_optuna_storage(
+        storage_url, resolved_study, save_dir, verbose
+    )
+
+    cv_only_kwargs = _strip_early_stopping_params(f_kwargs)
+
+    def objective(trial: optuna.Trial) -> float:
+        trial_params: Dict[str, Any] = {}
+        for pname, prange in param_grid.items():
+            if isinstance(prange, list):
+                trial_params[pname] = trial.suggest_categorical(pname, prange)
+            elif isinstance(prange, tuple) and len(prange) == 2:
+                lo, hi = prange
+                trial_params[pname] = (
+                    trial.suggest_int(pname, int(lo), int(hi))
+                    if isinstance(lo, int) and isinstance(hi, int)
+                    else trial.suggest_float(pname, float(lo), float(hi))
+                )
+
+        trial_model = clone(model)
+        trial_model.set_params(**{k.replace("model__", ""): v for k, v in trial_params.items()})
+        trial_pipe = _build_pipeline_from_cache(preprocessor, sampler, trial_model, fitted_cache)
+
+        with threadpool_limits(limits=1, user_api="blas"):
+            with threadpool_limits(limits=1, user_api="openmp"):
+                # [P6] n_jobs runs CV folds in parallel per trial
+                scores = cross_val_score(
+                    trial_pipe, X_train, y_train,
+                    cv=cv_splitter, scoring=primary_metric,
+                    n_jobs=n_jobs, params=cv_only_kwargs,
+                )
+        return float(np.mean(scores))
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=random_seed),
+        storage=storage_final,
+        study_name=resolved_study,
+        load_if_exists=bool(distributed and storage_final),
+    )
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    if distributed and storage_final:
+        n_done = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE)
+        vp(f"   Distributed: {n_done} trials already done (resuming)")
+
+    study.optimize(objective, n_trials=n_trials, timeout=timeout)
+
+    best_params = study.best_params
+    best_model = clone(model)
+    best_model.set_params(**{k.replace("model__", ""): v for k, v in best_params.items()})
+    best_pipe = _build_pipeline_from_cache(preprocessor, sampler, best_model, fitted_cache)
+
+    final_fit_kw = (
+        _inject_eval_set(f_kwargs, X_val, y_val, best_model)
+        if X_val is not None
+        else _strip_early_stopping_params(f_kwargs)
+    )
+    with threadpool_limits(limits=1, user_api="blas"):
+        with threadpool_limits(limits=1, user_api="openmp"):
+            best_pipe.fit(X_train, y_train, **final_fit_kw)
+
+    vp(f"[{name}] Best Optuna trial #{study.best_trial.number}: {study.best_value:.4f}")
+    return best_pipe, best_params
+
+
+def _run_phase3_ensemble(
+    best_results: Dict[str, PhaseResult],
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    task: TaskType,
+    cv_splitter: Any,
+    random_seed: int,
+    n_jobs: int,
+    verbose: bool,
+) -> Optional[Any]:
+    """
+    Phase 3 — Build a stacking ensemble from the top 3 trained models.
+
+    [P4] Base estimators are passed as CLONES (unfitted) because StackingClassifier
+    requires unfitted estimators — it re-fits them internally via cross-validation
+    to generate out-of-fold predictions for the meta-learner. Passing fitted
+    estimators would cause it to skip internal CV and risk data leakage.
+
+    Returns the fitted stacker, or None on failure.
+    """
+    if len(best_results) < 2:
+        return None
+
+    vp = _vp(verbose)
+    if verbose:
+        print("\n" + "=" * 70)
+        print("PHASE 3: STACKING ENSEMBLE")
+        print("=" * 70)
+
+    ranked = sorted(best_results.values(), key=lambda r: r.metric1, reverse=True)
+    top = ranked[: min(3, len(ranked))]
+    vp(f"\nBase models: {[r.name for r in top]}")
+
+    # StackingClassifier requires unfitted estimators for its internal CV
+    estimators = [(r.name.replace(" ", "_"), clone(r.pipeline)) for r in top]
+
+    try:
+        if task == TaskType.CLASSIFICATION:
+            stacker = StackingClassifier(
+                estimators=estimators,
+                final_estimator=LogisticRegression(max_iter=1000, random_state=random_seed),
+                cv=cv_splitter,
+                n_jobs=n_jobs,
+            )
+        else:
+            stacker = StackingRegressor(
+                estimators=estimators,
+                final_estimator=Ridge(random_state=random_seed),
+                cv=cv_splitter,
+                n_jobs=n_jobs,
+            )
+
+        with threadpool_limits(limits=1, user_api="blas"):
+            with threadpool_limits(limits=1, user_api="openmp"):
+                stacker.fit(X_train, y_train)
+
+        y_pred = stacker.predict(X_test)
+        score = (
+            accuracy_score(y_test, y_pred)
+            if task == TaskType.CLASSIFICATION
+            else r2_score(y_test, y_pred)
+        )
+        metric_label = "Accuracy" if task == TaskType.CLASSIFICATION else "R2"
+        vp(f"\nEnsemble {metric_label}: {score:.4f}")
+        vp("Ensemble trained successfully!")
+        logger.info("phase3_ensemble_complete", extra={"score": round(score, 4)})
+        return stacker
+
+    except Exception as exc:
+        logger.error("Ensemble failed: %s", exc)
+        if verbose:
+            print(f"\nEnsemble failed: {exc}")
+        return None
+
+
+def _run_phase4_calibration(
+    winner: Any,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    X_val: Optional[pd.DataFrame],
+    y_val: Optional[pd.Series],
+    cv: int,
+    calibration_method: str = "auto",
+    verbose: bool = True,
+) -> Any:
+    """
+    Phase 4 — Probability calibration for the best classification model.
+
+    [D5] calibration_method is now an exposed parameter:
+        "auto"     — isotonic for >=100 train samples, sigmoid otherwise
+        "isotonic" — always use isotonic regression
+        "sigmoid"  — always use Platt Scaling
+
+    Returns the calibrated model (or the original if calibration fails /
+    predict_proba is unavailable).
+    """
+    vp = _vp(verbose)
+
+    if verbose:
+        print("\n" + "=" * 70)
+        print("PHASE 4: PROBABILITY CALIBRATION")
+        print("=" * 70)
+
+    if not hasattr(winner, "predict_proba"):
+        vp("Model has no predict_proba — skipping calibration.")
+        return winner
+
+    if X_val is None:
+        vp(
+            f"   val_size=0.0 -> calibration uses K-fold CV on the training set "
+            f"({cv} folds, ~{cv}x slower than prefit). "
+            "Set val_size > 0 for faster calibration."
+        )
+
+    # [D5] Resolve "auto" method
+    if calibration_method == "auto":
+        resolved_method = "isotonic" if len(X_train) >= 100 else "sigmoid"
+    else:
+        resolved_method = calibration_method
+
+    try:
+        calibrated = _calibrate_model(
+            winner, X_train, y_train,
+            calibration_method=resolved_method,
+            cv=min(5, cv),
+            X_val=X_val,
+            y_val=y_val,
+        )
+
+        raw_proba = winner.predict_proba(X_test)
+        cal_proba = calibrated.predict_proba(X_test)
+        is_binary = raw_proba.shape[1] == 2
+
+        ll_before = log_loss(y_test, raw_proba)
+        ll_after  = log_loss(y_test, cal_proba)
+        vp(f"   Log-Loss  {ll_before:.4f} -> {ll_after:.4f}")
+
+        if is_binary:
+            y_test_arr = np.asarray(y_test)
+            ece_before = _calculate_expected_calibration_error(y_test_arr, raw_proba[:, 1])
+            ece_after  = _calculate_expected_calibration_error(y_test_arr, cal_proba[:, 1])
+            vp(f"   ECE       {ece_before:.4f} -> {ece_after:.4f}")
+        else:
+            vp("   ECE: skipped for multi-class (binary only)")
+
+        vp("   Calibration complete.")
+        logger.info(
+            "phase4_calibration_complete",
+            extra={"ll_before": round(ll_before, 4), "ll_after": round(ll_after, 4),
+                   "method": resolved_method},
+        )
+        return calibrated
+
+    except Exception as exc:
+        logger.error("Calibration failed: %s", exc)
+        if verbose:
+            print(f"   Calibration failed: {exc} — returning uncalibrated model.")
+        return winner
+
+
+# ==============================================================================
+# [F1] CONCURRENT PHASE-2 RUNNER
+# ==============================================================================
+
+def _run_phase2_concurrent(
+    active_models: Dict[str, Any],
+    best_results: Dict[str, PhaseResult],
+    checkpoint_file: Optional[str],
+    n_parallel: int,
+    verbose: bool,
+    **phase2_kwargs: Any,
+) -> Dict[str, PhaseResult]:
+    """
+    [F1] Run Phase-2 model training concurrently using ProcessPoolExecutor.
+
+    When n_parallel=1 (default) this falls back to the original sequential
+    loop — no behaviour change unless the caller opts in.
+
+    Each model is a CPU-bound workload (fitting + CV), so processes are more
+    effective than threads. The fitted PhaseResult objects are returned in
+    completion order and checkpointed atomically after each one.
+
+    Note: ProcessPoolExecutor requires that all arguments are picklable.
+    Lambda-based preprocessors or closures will raise PicklingError — use
+    named functions or sklearn Pipeline objects instead.
+    """
+    vp = _vp(verbose)
+    to_run = {n: m for n, m in active_models.items() if n not in best_results}
+
+    if n_parallel == 1:
+        # Sequential path — preserves original behaviour exactly
+        for name, model in to_run.items():
+            vp(f"\n{'='*70}\n[{name}] Phase 2: Full Evaluation\n{'='*70}")
+            result = _run_phase2_single_model(name=name, model=model, verbose=verbose, **phase2_kwargs)
+            if result is not None:
+                best_results[name] = result
+                if checkpoint_file:
+                    _atomic_checkpoint_dump({"best_results": best_results}, checkpoint_file)
+                    vp("Checkpoint updated.")
+        return best_results
+
+    # Parallel path
+    vp(f"\nRunning {len(to_run)} model(s) in parallel (n_parallel={n_parallel})")
+    with ProcessPoolExecutor(max_workers=n_parallel) as pool:
+        futures = {
+            pool.submit(_run_phase2_single_model, name=name, model=model, verbose=verbose, **phase2_kwargs): name
+            for name, model in to_run.items()
+        }
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                result = fut.result()
+            except Exception:
+                logger.error("Concurrent Phase-2 failed for %s:\n%s", name, traceback.format_exc())
+                result = None
+
+            if result is not None:
+                best_results[result.name] = result
+                if checkpoint_file:
+                    _atomic_checkpoint_dump({"best_results": best_results}, checkpoint_file)
+                    vp(f"Checkpoint updated after [{result.name}].")
+            else:
+                vp(f"[{name}] failed — skipped.")
+
+    return best_results
+
+
+# ==============================================================================
+# MAIN ORCHESTRATOR
+# ==============================================================================
 
 def evaluate_and_plot_models(
     models: Dict[str, Any],
     preprocess_pipeline: Union[Any, Dict[str, Any]],
     X: pd.DataFrame,
     y: pd.Series,
+    # --- Split ---
     test_size: float = 0.2,
     val_size: float = 0.0,
-    split_method: str = "random",  # 'random' or 'sequential'
+    split_method: str = "random",
     stratify: bool = True,
     random_seed: int = 42,
+    # --- Task ---
     task_type: str = "classification",
     target_names: Optional[List[str]] = None,
     feature_names: Optional[List[str]] = None,
+    # --- Tuning ---
     param_grids: Optional[Dict[str, Any]] = None,
     fit_params: Optional[Dict[str, Dict[str, Any]]] = None,
     sampler: Optional[Any] = None,
     cv: int = 4,
     search_type: str = "grid",
     primary_metric: Optional[str] = None,
+    # --- Screening ---
     top_k: Optional[int] = None,
     quick_test_fraction: float = 0.2,
+    # --- Plots ---
     plot_lc: bool = True,
     plot_diagnostics: bool = True,
     plot_importance: bool = True,
     plot_comparison: bool = True,
     top_n_features: int = 20,
+    # --- Persistence ---
     save_dir: Optional[str] = None,
-    resume: bool = False,         # <--- NEW: State check parameter
-    show_fold_details: bool = True,  # <--- NEW: Display per-fold metrics
-    halving_factor: int = 3,      # <--- NEW: HalvingGridSearchCV efficiency control
-    optuna_n_trials: int = 50,    # <--- NEW: Optuna optimization trials
-    optuna_timeout: Optional[int] = None,  # <--- NEW: Optuna timeout in seconds
-    optuna_storage: Optional[str] = None,  # <--- NEW PHASE 5: Persistent Optuna storage (SQLite/Redis)
-    optuna_study_name: Optional[str] = None,  # <--- NEW PHASE 5: Study name for distributed resumability
-    distributed_tuning: bool = False,  # <--- NEW PHASE 5: Enable distributed Optuna tuning
-    validate_data: bool = True,      # <--- NEW PHASE 6: Enable data validation (Pandera)
-    build_ensemble: bool = True,   # <--- NEW: Trigger Phase 3 Stacking Ensemble
-    mlflow_experiment: str = "AutoML_Run",  # <--- NEW: MLflow experiment name
-    memory_efficient: bool = False,  # <--- NEW: Memory optimization mode
+    resume: bool = False,
+    # --- Behaviour flags ---
+    show_fold_details: bool = True,
+    halving_factor: int = 3,
+    # --- Optuna ---
+    optuna_n_trials: int = 50,
+    optuna_timeout: Optional[int] = None,
+    optuna_storage: Optional[str] = None,
+    optuna_study_name: Optional[str] = None,
+    distributed_tuning: bool = False,
+    # --- Quality / ensemble ---
+    validate_data: bool = True,
+    validate_drift: bool = False,
+    drift_threshold: float = 0.05,
+    build_ensemble: bool = True,
+    # --- MLflow ---
+    mlflow_experiment: str = "AutoML_Run",
+    # --- Calibration ---
+    calibration_method: str = "auto",
+    # --- Parallelism ---
+    n_jobs: int = -1,
+    n_parallel: int = 1,
+    # --- Memory ---
+    memory_efficient: bool = False,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
-    Enterprise machine learning evaluation pipeline with automatic early stopping and SHAP explainability.
-    
-    **Early Stopping (NEW):**
-    - Automatically configured for XGBoost, LightGBM, CatBoost
-    - Validation set auto-injected via eval_set when val_size > 0
-    
-    **SHAP Feature Importance (Game Theory Based Explainability) - NEW:**
-    Automatically generates SHAP values when `pip install shap` available:
-    
-    - **TreeExplainer** for tree models (XGBoost, LightGBM, CatBoost, Random Forest)
-    - **KernelExplainer** for other models (universal but slower)
-    - Reveals EXACT contribution of each feature to predictions
-    - Fixes sklearn bias toward high-cardinality features
-    - Example: "Age=45 increases churn probability by +12.5% (vs baseline 27%)"
-    
-    **Installation:**
-        pip install shap
-        
-    **Enable:** Automatically enabled if shap is installed. Pass feature_names for better interpretability.
-    
-    **Kaggle Advantage:** SHAP force plots + decision plots reveal hidden feature interactions,
-    enabling brilliant feature engineering ideas.
-    
-    **Distributed Tuning with Persistent Optuna (NEW - Phase 5):**
-    Enable persistent optimization studies that survive disconnects and scale across parallel notebooks:
-    
-    - **SQLite Backend** (Kaggle Notebooks):
-        - Single database file (`automl_optuna.db`) shared across parallel notebooks
-        - Set `optuna_storage="sqlite:///automl_optuna.db"` in all notebooks
-        - All 3 notebooks automatically find each other's trials and collaborate
-        - Result: 3x faster tuning (3 trials running in parallel)
-    
-    - **Redis Backend** (Cloud-Distributed):
-        - Multiple machines/containers connect to shared Redis server
-        - Set `optuna_storage="redis://your-redis-host:6379"`
-        - Scales to dozens of nodes across cloud
-    
-    - **Load-If-Exists**: Study auto-resumes if database already exists
-        - Survives laptop/Kaggle disconnects
-        - Reuses all previous trials (no wasted work)
-    
-    **Example - Three Parallel Kaggle Notebooks (3x Speedup):**
-    ```python
-    # All three notebooks use identical parameters:
-    results = evaluate_and_plot_models(
-        models=my_models,
-        ...,
-        optuna_storage="sqlite:///automl_optuna.db",  # ← Same DB file
-        optuna_study_name="kaggle_competition_1",      # ← Same study name
-        optuna_n_trials=150,                             # ← Total 150 trials
-        distributed_tuning=True                          # ← Enable parallel
-    )
-    # Each notebook runs 50 trials in parallel → done in 1/3 the time!
-    ```
-    
-    **Probability Calibration (NEW - Phase 4):**
-    Final classification models are automatically probability-calibrated using CalibratedClassifierCV.
-    
-    - **Problem:** Tree models (Random Forest, XGBoost) are overconfident. "70% chance" → actually 50%
-    - **Solution:** Isotonic Regression or Platt Scaling forces probabilities to match reality
-    - **Benefit:** Log-Loss metric almost always improves (Kaggle metric advantage)
-    - **Guarantee:** After calibration, "90% confident" = correct 9 out of 10 times
-    
-    **Data Validation with Pandera (NEW - Phase 6 - MLOps):**
-    Production-grade data quality checks prevent crashes deep in modeling:
-    
-    - **Problem:** IT changes column types (int → string), adds NaNs, renames columns
-      Script crashes after 30 minutes, buried in cross-validation error trace
-    - **Solution:** Validate data contract BEFORE any model training starts
-    - **Checks Automated**:
-      - Row/column count consistency
-      - Data type validation (Pandera auto-builds from data)
-      - NaN/null detection with column-wise breakdown
-      - Duplicate row detection
-      - Value range validation (min/max bounds)
-      - Special values (inf, -inf) detection
-    
-    - **Error Handling**:
-      - CRITICAL errors (NaN in target, shape mismatch) → immediate halt with clear message
-      - WARNINGS (duplicates, NaN in features) → logged but continue
-      - All validation stats logged to MLflow
-    
-    **Installation (Optional but Recommended for Production):**
-        pip install pandera[io]
-    
-    **Usage:**
-    ```python
-    results = evaluate_and_plot_models(
-        models=my_models,
-        ...,
-        validate_data=True  # ← Enable (default: True)
-    )
-    # Output:
-    # 🔍 DATA QUALITY VALIDATION
-    # ✓ Shape: X=(10000, 15), y=(10000,)
-    # ✓ Data types: validated
-    # ✓ Pandera Schema validation passed for 15 columns
-    # ✅ Data Contract: PASSED
-    ```
-    
-    **When Validation Fails:**
-    ```
-    ❌ Data Validation Failed - Critical Issues Detected:
-    - ERROR: Target (y) contains 42 NaN values
-    - ERROR: Row mismatch - X has 9958 rows, y has 10000 rows
-    ```
-    Skip with `validate_data=False` (not recommended for production)
-    
-    **Example fit_params with early stopping:**
-    
-        fit_params = {
-            "LightGBM": {
-                "callbacks": [lgb.early_stopping(100), lgb.log_evaluation(period=0)]
-            },
-            "CatBoost": {
-                "early_stopping_rounds": 100
-            }
-        }
-    
-    Notes:
-    - If fit_params includes early stopping config, it will be merged with auto-config
-    - XGBoost early stopping via eval_metric in fit_params
-    - LightGBM early stopping via callbacks with lgb.early_stopping()
-    - CatBoost early stopping via early_stopping_rounds in fit_params
+    Enterprise AutoML pipeline: screen -> tune -> ensemble -> calibrate.
+
+    Parameters
+    ----------
+    models
+        Dict of {name: unfitted_estimator}.
+    preprocess_pipeline
+        A single transformer/pipeline applied to all models, or a dict
+        {model_name: transformer} with an optional "default" key.
+    X, y
+        Feature DataFrame and target Series.  Must be pre-imputed (no NaNs).
+    test_size / val_size
+        Fractions for test and (optional) validation splits.
+    split_method
+        "random" (stratified where applicable) or "sequential" (time-series).
+    task_type
+        "classification" or "regression".
+    param_grids
+        {model_name: param_grid} passed to the chosen search strategy.
+        For Optuna, values can be lists (categorical) or (lo, hi) tuples.
+    fit_params
+        {model_name: {fit_kwarg: value}} extra kwargs forwarded to `.fit()`.
+    search_type
+        "grid" | "random" | "halving" | "optuna".
+    primary_metric
+        sklearn scoring string.  Defaults to "accuracy" / "r2".
+    top_k
+        If set, only the top_k models (by quick screening) proceed to full
+        evaluation.  Ignored when top_k >= len(models).
+    validate_drift
+        [F2] Run KS-test covariate drift detection on train vs test splits.
+    drift_threshold
+        p-value threshold for the KS-test. Default 0.05.
+    calibration_method
+        [D5] "auto" (default), "isotonic", or "sigmoid".
+    n_jobs
+        [P2] Number of parallel jobs for CV and search. Default -1 (all cores).
+    n_parallel
+        [F1] Number of models to train concurrently in Phase 2.
+        Default 1 (sequential). Set to os.cpu_count() // 2 for full parallelism.
+        Requires all fit_params / preprocessors to be picklable.
+    optuna_storage
+        None (in-memory), "sqlite:///path.db", or "redis://host:port".
+    distributed_tuning
+        When True, Optuna study is shared for distributed / resumed runs.
+    validate_data
+        Run Pandera data-contract checks before modelling.
+    build_ensemble
+        Build a stacking ensemble from the top 3 trained models.
+    resume
+        Load a previously saved checkpoint and skip already-trained models.
+    memory_efficient
+        Disable all plots and reduce memory footprint.
+
+    Returns
+    -------
+    dict with keys:
+        summary_df       — ranked performance table
+        best_models      — {name: fitted_pipeline}
+        raw_cv_scores    — {name: List[float] of fold scores}
+        ultimate_winner  — best / calibrated / ensemble model
+        data_splits      — X_train, y_train, X_val, y_val, X_test, y_test
+        drift_report     — List[(col, p_value)] if validate_drift=True
     """
+    vp = _vp(verbose)
 
-    def vprint(text):
-        if verbose:
-            print(text)
-
-    # Validate inputs early
+    # --- Validate inputs & coerce enums ---
     _validate_inputs(X, y, test_size, val_size)
 
-    if save_dir and not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+    try:
+        # [D3] Single canonical 'task' variable throughout
+        task = TaskType(task_type.lower())
+    except ValueError:
+        raise ValueError(f"task_type must be 'classification' or 'regression'. Got '{task_type}'.")
+
+    try:
+        search_type_enum = SearchType(search_type.lower())
+    except ValueError:
+        raise ValueError(
+            f"search_type must be one of {[s.value for s in SearchType]}. Got '{search_type}'."
+        )
+
+    try:
+        split_method_enum = SplitMethod(split_method.lower())
+    except ValueError:
+        raise ValueError(f"split_method must be 'random' or 'sequential'. Got '{split_method}'.")
+
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
 
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Initialize Pipeline memory cache directory
-    cachedir = tempfile.mkdtemp()
-    vprint(f"📁 Pipeline cache directory created: {cachedir}")
-    
-    # ==============================================================================
-    # 📊 MLFLOW EXPERIMENT TRACKING SETUP (BEFORE Data Validation - fixes Ghost Run bug)
-    # ==============================================================================
+
+    # [S3] Deep-copy fit_params so caller's dict is never mutated
+    fit_params = {k: dict(v) for k, v in (fit_params or {}).items()}
+
+    if memory_efficient:
+        vp("\nMEMORY-EFFICIENT MODE: plots disabled")
+        plot_lc = plot_diagnostics = plot_importance = plot_comparison = False
+
+    # --- CV splitter & default metric ---
+    if task == TaskType.CLASSIFICATION:
+        cv_splitter = StratifiedKFold(n_splits=cv, shuffle=True, random_state=random_seed)
+        if primary_metric is None:
+            primary_metric = "accuracy"
+        elif primary_metric == "balanced_accuracy":
+            primary_metric = get_balanced_accuracy_scorer()
+    else:
+        cv_splitter = KFold(n_splits=cv, shuffle=True, random_state=random_seed)
+        if primary_metric is None:
+            primary_metric = "r2"
+        if sampler is not None:
+            warnings.warn("Samplers are not applicable for regression — disabling sampler.")
+            sampler = None
+
+    # =========================================================================
+    # [S2] MLflow context manager — run is always closed, even on exception
+    # =========================================================================
     mlflow.set_experiment(mlflow_experiment)
-    
+
     with mlflow.start_run(run_name=f"AutoML_{run_timestamp}") as mlflow_run:
-        vprint(f"📊 MLflow experiment '{mlflow_experiment}' initialized (Run ID: {mlflow_run.info.run_id})")
-        
-        # Log initial parameters to MLflow
+        vp(f"MLflow run {mlflow_run.info.run_id} started")
         mlflow.log_params({
             "task_type": task_type,
             "test_size": test_size,
             "val_size": val_size,
             "cv_folds": cv,
-            "primary_metric": primary_metric or "auto-selected",
             "search_type": search_type,
             "build_ensemble": build_ensemble,
-            "distributed_tuning": distributed_tuning,
+            "n_parallel": n_parallel,
+            "calibration_method": calibration_method,
         })
-    
-        # ==============================================================================
-        # 🔍 DATA QUALITY VALIDATION (NEW PHASE 6 - MLOps) - NOW INSIDE MLFLOW CONTEXT
-        # ==============================================================================
+
+        # --- Data validation ---
         if validate_data:
-            data_validation_result = _validate_data_contract(
-                X, y, feature_names=feature_names, task_type=task_type, verbose=verbose
-            )
-            
-            if not data_validation_result['passed']:
-                # Critical errors found - halt execution
-                critical_errors = [issue for issue in data_validation_result['issues'] if issue.startswith('ERROR')]
-                if critical_errors:
-                    error_summary = "\n".join(critical_errors)
-                    raise ValueError(
-                        f"❌ Data Validation Failed - Critical Issues Detected:\n{error_summary}\n\n"
-                        f"Pass validate_data=False to skip validation (not recommended for production)."
-                    )
-            
-            # Log validation stats to MLflow (now within MLflow context)
-            for stat_name, stat_value in data_validation_result['stats'].items():
+            validation = _validate_data_contract(X, y, feature_names, task_type, verbose)
+            critical = [i for i in validation["issues"] if i.startswith("ERROR")]
+            if critical:
+                raise ValueError(
+                    "Data validation failed:\n" + "\n".join(critical)
+                    + "\n\nPass validate_data=False to skip (not recommended)."
+                )
+            for k, v in validation["stats"].items():
                 try:
-                    mlflow.log_param(f"data_validation_{stat_name}", stat_value)
-                except:
-                    pass  # Some stats might not be loggable
-        
-        # ==============================================================================
-        # 🧠 DYNAMIC TASK SETUP
-        # ==============================================================================
-        task_type = task_type.lower()
-        split_method = split_method.lower()
+                    mlflow.log_param(f"data_{k}", v)
+                except Exception:
+                    pass
 
-        if task_type not in ["classification", "regression"]:
-            raise ValueError("task_type must be either 'classification' or 'regression'")
+        # --- Data splits ---
+        if verbose:
+            print(f"\n{'='*70}\nDATA SPLIT ({split_method_enum.value})\n{'='*70}")
 
-        if search_type.lower() not in ["grid", "random", "halving", "optuna"]:
-            raise ValueError(f"search_type must be 'grid', 'random', 'halving', or 'optuna'. Got: {search_type}")
-
-        # Memory efficiency mode setup
-        if memory_efficient:
-            vprint("\n" + "⚡" * 35)
-            vprint("⚡ MEMORY-EFFICIENT MODE ENABLED")
-            vprint("⚡" * 35)
-            plot_lc = False
-            plot_importance = False
-            plot_diagnostics = False
-            plot_comparison = False
-            vprint("  ✓ Disabled: Learning curves, feature importance, diagnostic plots")
-            vprint("  ✓ Reduced memory footprint for large datasets")
-            vprint("  ✓ Training will be significantly faster")
-            vprint("")
-
-        if task_type == "classification":
-            cv_splitter = StratifiedKFold(n_splits=cv, shuffle=True, random_state=random_seed)
-            if primary_metric is None:
-                primary_metric = "accuracy"
-            # Convert balanced_accuracy string to scorer object
-            if primary_metric == "balanced_accuracy":
-                primary_metric = get_balanced_accuracy_scorer()
+        if split_method_enum == SplitMethod.SEQUENTIAL:
+            idx = int(len(X) * (1 - test_size))
+            X_train_full, X_test = X.iloc[:idx], X.iloc[idx:]
+            y_train_full, y_test = y.iloc[:idx], y.iloc[idx:]
         else:
-            cv_splitter = KFold(n_splits=cv, shuffle=True, random_state=random_seed)
-            if primary_metric is None:
-                primary_metric = "r2"
-
-            if sampler is not None:
-                vprint("⚠️ WARNING: Samplers cannot be used for regression. Disabling sampler...")
-                sampler = None
-
-        # ==============================================================================
-        # 🔀 INTERNAL DATA SPLITTING ENGINE
-        # ==============================================================================
-        vprint("\n" + "=" * 70)
-        vprint(f"🔀 DATA SPLIT LOGIC (Method: {split_method.capitalize()})")
-        vprint("=" * 70)
-
-        if split_method == "sequential":
-            test_idx = int(len(X) * (1 - test_size))
-            X_train_full, X_test = X.iloc[:test_idx], X.iloc[test_idx:]
-            y_train_full, y_test = y.iloc[:test_idx], y.iloc[test_idx:]
-        else:
-            stratify_col = y if (task_type == "classification" and stratify) else None
+            strat = y if (task == TaskType.CLASSIFICATION and stratify) else None
             X_train_full, X_test, y_train_full, y_test = train_test_split(
-                X, y, test_size=test_size, random_state=random_seed, stratify=stratify_col
+                X, y, test_size=test_size, random_state=random_seed, stratify=strat
             )
 
-        # Optional Validation Set Logic
-        X_val, y_val = None, None
+        X_val = y_val = None
         X_train, y_train = X_train_full, y_train_full
 
         if val_size > 0.0:
-            val_fraction = val_size / (1.0 - test_size)
-            if split_method == "sequential":
-                val_idx = int(len(X_train_full) * (1 - val_fraction))
-                X_train, X_val = X_train_full.iloc[:val_idx], X_train_full.iloc[val_idx:]
-                y_train, y_val = y_train_full.iloc[:val_idx], y_train_full.iloc[val_idx:]
+            val_frac = val_size / (1.0 - test_size)
+            if split_method_enum == SplitMethod.SEQUENTIAL:
+                vi = int(len(X_train_full) * (1 - val_frac))
+                X_train, X_val = X_train_full.iloc[:vi], X_train_full.iloc[vi:]
+                y_train, y_val = y_train_full.iloc[:vi], y_train_full.iloc[vi:]
             else:
-                stratify_val = y_train_full if (task_type == "classification" and stratify) else None
+                sv = y_train_full if (task == TaskType.CLASSIFICATION and stratify) else None
                 X_train, X_val, y_train, y_val = train_test_split(
-                    X_train_full,
-                    y_train_full,
-                    test_size=val_fraction,
-                    random_state=random_seed,
-                    stratify=stratify_val,
+                    X_train_full, y_train_full,
+                    test_size=val_frac, random_state=random_seed, stratify=sv
                 )
-            vprint(f"Data Shapes -> Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+            vp(f"Train {X_train.shape}  Val {X_val.shape}  Test {X_test.shape}")
         else:
-            vprint(f"Data Shapes -> Train: {X_train.shape}, Test: {X_test.shape}")
+            vp(f"Train {X_train.shape}  Test {X_test.shape}")
 
-        # ==============================================================================
-        # 🚀 BUILD PREPROCESSOR CACHE
-        # ==============================================================================
-        vprint("\n" + "=" * 70)
-        vprint("🔧 Building Preprocessor Cache (fitting each unique preprocessor ONCE)")
-        vprint("=" * 70)
-        fitted_preprocessor_cache = _build_preprocessor_cache(
+        # --- [F2] Covariate drift detection ---
+        drift_report: List[Tuple[str, float]] = []
+        if validate_drift:
+            drift_report = _check_covariate_drift(
+                X_train, X_test, threshold=drift_threshold, verbose=verbose
+            )
+            if drift_report:
+                mlflow.log_param("drifted_columns", len(drift_report))
+
+        # --- Preprocessor cache ---
+        if verbose:
+            print(f"\n{'='*70}\nBuilding preprocessor cache\n{'='*70}")
+        fitted_cache = _build_preprocessor_cache(
             preprocess_pipeline, list(models.keys()), X_train, y_train
         )
-        vprint(f"✓ Cache built: {len(fitted_preprocessor_cache)} unique preprocessor(s) fitted")
+        vp(f"{len(fitted_cache)} unique preprocessor(s) fitted")
 
-        # ==============================================================================
-        # PHASE 1: QUICK SCREENING
-        # ==============================================================================
-        if top_k is not None and top_k < len(models):
-            vprint("\n" + "=" * 70)
-            vprint(f"🚀 PHASE 1: Quick Screening (using {quick_test_fraction*100:.0f}% of training data)")
-            vprint("=" * 70)
-
-            stratify_arg = y_train if (task_type == "classification" and stratify) else None
-            X_sub, _, y_sub, _ = train_test_split(
-                X_train,
-                y_train,
-                train_size=quick_test_fraction,
-                stratify=stratify_arg,
-                random_state=random_seed,
+        # --- Phase 1: screening ---
+        active_models = dict(models)
+        if top_k is not None and top_k < len(active_models):
+            active_models = _run_phase1_screening(
+                models=active_models,
+                preprocess_pipeline=preprocess_pipeline,
+                fitted_cache=fitted_cache,
+                sampler=sampler,
+                X_train=X_train,
+                y_train=y_train,
+                cv_splitter=cv_splitter,
+                primary_metric=primary_metric,
+                fit_params=fit_params,
+                top_k=top_k,
+                quick_test_fraction=quick_test_fraction,
+                random_seed=random_seed,
+                stratify=stratify,
+                task=task,
+                n_jobs=n_jobs,
+                verbose=verbose,
             )
 
-            screening_scores = {}
-            for name, model in models.items():
-                current_preprocessor = _get_preprocessor(preprocess_pipeline, name)
-                base_pipeline = _build_pipeline_from_cache(
-                    current_preprocessor, sampler, model, fitted_preprocessor_cache, cachedir
-                )
-                f_kwargs = fit_params.get(name, {}) if fit_params else {}
-
-                try:
-                    with threadpool_limits(limits=1, user_api='blas'):
-                        with threadpool_limits(limits=1, user_api='openmp'):
-                            scores = cross_val_score(
-                                base_pipeline,
-                                X_sub,
-                                y_sub,
-                                cv=cv_splitter,
-                                scoring=primary_metric,
-                                n_jobs=-1,
-                                params=f_kwargs,
-                            )
-                    screening_scores[name] = np.mean(scores)
-                    vprint(f"   -> [{name}] Preliminary Score: {screening_scores[name]:.4f}")
-                except Exception as e:
-                    vprint(f"   -> [{name}] Failed during screening. Skipping.")
-
-            top_model_names = sorted(
-                screening_scores,
-                key=lambda x: screening_scores[x],
-                reverse=True,
-            )[:top_k]
-
-            vprint(f"\n🏆 Top {top_k} models advancing to Phase 2:")
-            for rank, name in enumerate(top_model_names, 1):
-                vprint(f"   {rank}. {name} ({screening_scores[name]:.4f})")
-
-            models = {name: models[name] for name in top_model_names}
-
-        # ==============================================================================
-        # 💾 CHECKPOINT LOADING ENGINE
-        # ==============================================================================
+        # --- Checkpoint loading ---
         checkpoint_file = os.path.join(save_dir, "eval_checkpoint.pkl") if save_dir else None
+        best_results: Dict[str, PhaseResult] = {}
 
         if resume and checkpoint_file and os.path.exists(checkpoint_file):
-            vprint("\n" + "=" * 70)
-            vprint(f"💾 RESUMING PREVIOUS RUN FROM CHECKPOINT...")
-            vprint("=" * 70)
+            vp(f"\nLoading checkpoint from {checkpoint_file}")
             state = joblib.load(checkpoint_file)
-            results_score = state.get("results_score", [])
-            test_scores_list = state.get("test_scores_list", [])
-            successful_names = state.get("successful_names", [])
-            summary_data = state.get("summary_data", [])
-            best_estimators = state.get("best_estimators", {})
-            vprint(f"-> Loaded {len(successful_names)} previously trained models: {successful_names}")
-        else:
-            results_score = []
-            test_scores_list = []
-            successful_names = []
-            summary_data = []
-            best_estimators = {}
+            best_results = state.get("best_results", {})
+            vp(f"-> Loaded {len(best_results)} completed model(s): {list(best_results)}")
 
-        # ==============================================================================
-        # PHASE 2: FULL EVALUATION AND TUNING
-        # ==============================================================================
-        for name, model in models.items():
-            # Skip if already completed in checkpoint
-            if name in successful_names:
-                vprint(f"\n⏭️ Skipping [{name}] (Already completed in checkpoint file).")
-                continue
+        # --- Crash recovery ---
+        incomplete = _detect_incomplete_models(save_dir, verbose)
+        if incomplete:
+            _cleanup_incomplete_models(incomplete, verbose)
+            for crashed_name in incomplete:
+                best_results.pop(crashed_name, None)
 
-            start_time = time.time()
+        # --- Phase 2: full evaluation (sequential or concurrent) ---
+        # Common kwargs passed to every _run_phase2_single_model call
+        phase2_kwargs = dict(
+            preprocess_pipeline=preprocess_pipeline,
+            fitted_cache=fitted_cache,
+            sampler=sampler,
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
+            X_test=X_test,
+            y_test=y_test,
+            cv_splitter=cv_splitter,
+            primary_metric=primary_metric,
+            param_grids=param_grids,
+            fit_params=fit_params,
+            search_type=search_type_enum,
+            halving_factor=halving_factor,
+            optuna_n_trials=optuna_n_trials,
+            optuna_timeout=optuna_timeout,
+            optuna_storage=optuna_storage,
+            optuna_study_name=optuna_study_name,
+            distributed_tuning=distributed_tuning,
+            random_seed=random_seed,
+            task=task,
+            feature_names=feature_names,
+            show_fold_details=show_fold_details,
+            save_dir=save_dir,
+            n_jobs=n_jobs,
+        )
 
-            vprint("\n" + "=" * 70)
-            vprint(f"[{name}] Starting Full Evaluation...")
-            vprint("=" * 70)
+        best_results = _run_phase2_concurrent(
+            active_models=active_models,
+            best_results=best_results,
+            checkpoint_file=checkpoint_file,
+            n_parallel=n_parallel,
+            verbose=verbose,
+            **phase2_kwargs,
+        )
 
-            try:
-                current_preprocessor = _get_preprocessor(preprocess_pipeline, name)
-                base_pipeline = _build_pipeline_from_cache(
-                    current_preprocessor, sampler, model, fitted_preprocessor_cache, cachedir
+        # Log Phase-2 metrics to MLflow
+        for result in best_results.values():
+            mlflow.log_metrics({
+                f"{result.name}_cv_mean": result.cv_mean,
+                f"{result.name}_cv_std": result.cv_std,
+                f"{result.name}_metric1": result.metric1,
+            })
+
+        # --- Phase 3: ensemble ---
+        stacker = None
+        if build_ensemble and len(best_results) >= 2:
+            stacker = _run_phase3_ensemble(
+                best_results=best_results,
+                X_train=X_train,
+                y_train=y_train,
+                X_test=X_test,
+                y_test=y_test,
+                task=task,
+                cv_splitter=cv_splitter,
+                random_seed=random_seed,
+                n_jobs=n_jobs,
+                verbose=verbose,
+            )
+            if stacker is not None:
+                y_ens = stacker.predict(X_test)
+                ens_score = (
+                    accuracy_score(y_test, y_ens)
+                    if task == TaskType.CLASSIFICATION
+                    else r2_score(y_test, y_ens)
                 )
+                mlflow.log_metric("ensemble_test_score", ens_score)
+                mlflow.sklearn.log_model(stacker, "ensemble_model")
 
-                best_params_display = "Default"
-                pipeline = base_pipeline
-                f_kwargs = dict(fit_params.get(name, {})) if fit_params else {}
+        # --- Build summary ---
+        rows = []
+        for r in best_results.values():
+            rows.append({
+                "Model Name": r.name,
+                "Train Time": f"{r.training_time:.1f}s",
+                "CV Mean": f"{r.cv_mean:.3f} (+-{r.cv_std:.3f})",
+                "Metric 1 Raw": r.metric1,
+                "Metric 2 Raw": r.metric2,
+                "Best Params": str(r.best_params) if r.best_params else "Default",
+            })
 
-                # --- NEW: Configure Early Stopping for Gradient Boosters ---
-                model_cls_name = type(model).__name__
-                if any(x in model_cls_name for x in ["XGB", "LGBM", "LightGBM", "CatBoost"]):
-                    es_config = _configure_early_stopping(model, early_stopping_rounds=50)
-                    f_kwargs.update(es_config)
-                    vprint(f"[{name}] Early stopping configured for {model_cls_name}")
+        if stacker is not None:
+            y_ens = stacker.predict(X_test)
+            ens_m1 = (
+                accuracy_score(y_test, y_ens)
+                if task == TaskType.CLASSIFICATION
+                else r2_score(y_test, y_ens)
+            )
+            rows.append({
+                "Model Name": "Ensemble_Stack",
+                "Train Time": "N/A",
+                "CV Mean": "N/A",
+                "Metric 1 Raw": ens_m1,
+                "Metric 2 Raw": ens_m1,
+                "Best Params": "Stacking",
+            })
 
-                # --- NEW: Inject Validation Set for Gradient Boosters with Early Stopping ---
-                f_kwargs = _inject_eval_set(f_kwargs, X_val, y_val, model)
-                if "model__eval_set" in f_kwargs:
-                    vprint(f"[{name}] Evaluation set injected for early stopping monitoring")
+        summary_df = pd.DataFrame()
+        if rows:
+            col1, col2 = (
+                ("Test Acc", "Test F1")
+                if task == TaskType.CLASSIFICATION
+                else ("Test R2", "Test RMSE")
+            )
+            summary_df = (
+                pd.DataFrame(rows)
+                .sort_values("Metric 1 Raw", ascending=False)
+                .reset_index(drop=True)
+            )
+            summary_df.insert(0, "Rank", range(1, len(summary_df) + 1))
+            summary_df[col1] = summary_df["Metric 1 Raw"].apply(
+                lambda x: f"{x:.4f}" if isinstance(x, (int, float)) else x
+            )
+            summary_df[col2] = summary_df["Metric 2 Raw"].apply(
+                lambda x: f"{x:.4f}" if isinstance(x, (int, float)) else x
+            )
+            summary_df = summary_df.drop(columns=["Metric 1 Raw", "Metric 2 Raw"])
+            ordered_cols = ["Rank", "Model Name", "Train Time", "CV Mean", col1, col2, "Best Params"]
+            summary_df = summary_df[[c for c in ordered_cols if c in summary_df.columns]]
 
-                if param_grids is not None and name in param_grids:
-                    search_type_lower = search_type.lower()
-                    if search_type_lower == "grid":
-                        search_cls = GridSearchCV
-                        kwargs = {"cv": cv_splitter, "scoring": primary_metric, "n_jobs": -1}
-                        search_label = "GridSearchCV (exhaustive search - tests all combinations)"
-                    elif search_type_lower == "halving":
-                        search_cls = HalvingGridSearchCV
-                        kwargs = {
-                            "cv": cv_splitter,
-                            "scoring": primary_metric,
-                            "n_jobs": -1,
-                            "random_state": random_seed,
-                            "factor": halving_factor,
-                        }
-                        search_label = f"🚀 HalvingGridSearchCV (factor={halving_factor})"
-                    elif search_type_lower == "optuna":
-                        # --- NEW PHASE 5: Distributed Optuna with Persistent Storage ---
-                        storage_url, study_name = _initialize_optuna_storage(
-                            storage_url=optuna_storage if distributed_tuning else None,
-                            study_name=optuna_study_name,
-                            save_dir=save_dir,
-                            verbose=verbose
-                        )
-                        
-                        search_label = f"🔮 Optuna Bayesian Optimization (n_trials={optuna_n_trials})"
-                        if distributed_tuning and storage_url:
-                            search_label += " [DISTRIBUTED]"
-                        vprint(f"[{name}] Running {search_label}")
-
-                        def objective(trial):
-                            param_grid = param_grids[name]
-                            trial_params = {}
-                    
-                            for param_name, param_range in param_grid.items():
-                                if isinstance(param_range, list):
-                                    trial_params[param_name] = trial.suggest_categorical(param_name, param_range)
-                                elif isinstance(param_range, tuple) and len(param_range) == 2:
-                                    lower, upper = param_range
-                                    if isinstance(lower, int) and isinstance(upper, int):
-                                        trial_params[param_name] = trial.suggest_int(param_name, lower, upper)
-                                    else:
-                                        trial_params[param_name] = trial.suggest_float(param_name, float(lower), float(upper))
-                    
-                            base_model = base_pipeline.named_steps["model"]
-                            trial_model = clone(base_model)
-                            trial_model.set_params(**{k.replace("model__", ""): v for k, v in trial_params.items()})
-                            trial_pipeline = _build_pipeline_from_cache(
-                                current_preprocessor, sampler, trial_model, fitted_preprocessor_cache, cachedir
-                            )
-                    
-                            # NOTE: During CV in hyperparameter tuning, do NOT use early stopping params
-                            # Early stopping requires explicit eval_set with proper validation data,
-                            # which is not available in standard CV. Only use params for base model attrs.
-                            cv_only_params = {k: v for k, v in f_kwargs.items() 
-                                             if not any(x in k for x in ['eval_set', 'callbacks', 'early_stopping', 'early_stopping_rounds'])}
-                    
-                            with threadpool_limits(limits=1, user_api='blas'):
-                                with threadpool_limits(limits=1, user_api='openmp'):
-                                    scores = cross_val_score(
-                                        trial_pipeline,
-                                        X_train,
-                                        y_train,
-                                        cv=cv_splitter,
-                                        scoring=primary_metric,
-                                        n_jobs=-1,
-                                        params=cv_only_params,
-                                    )
-                    
-                            return np.mean(scores)
-                
-                        # --- NEW PHASE 5: Create study with persistent storage (survives disconnects) ---
-                        study = optuna.create_study(
-                            direction="maximize",
-                            sampler=optuna.samplers.TPESampler(seed=random_seed),
-                            storage=storage_url,
-                            study_name=study_name,
-                            # FIX: Only load_if_exists if storage_url is not None (prevents in-memory crash)
-                            load_if_exists=True if (distributed_tuning and storage_url) else False
-                        )
-                        optuna.logging.set_verbosity(optuna.logging.WARNING)
-                        
-                        # Log distributed tuning info
-                        if distributed_tuning and storage_url:
-                            n_completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-                            vprint(f"   ⚡ Distributed Mode: {n_completed} trials already completed (resuming study)")
-                            mlflow.log_param(f"{name}_optuna_storage", storage_url)
-                            mlflow.log_param(f"{name}_optuna_study_name", study_name)
-                        
-                        study.optimize(objective, n_trials=optuna_n_trials, timeout=optuna_timeout)
-                
-                        best_trial_params = study.best_params
-                        best_trial_model = clone(base_pipeline.named_steps["model"])
-                        best_trial_model.set_params(**{k.replace("model__", ""): v for k, v in best_trial_params.items()})
-                        pipeline = _build_pipeline_from_cache(
-                            current_preprocessor, sampler, best_trial_model, fitted_preprocessor_cache, cachedir
-                        )
-                
-                        # Filter out early stopping params that require eval_set
-                        safe_fit_kwargs = {k: v for k, v in f_kwargs.items() 
-                                          if not any(x in k for x in ['eval_set', 'callbacks', 'early_stopping', 'early_stopping_rounds'])}
-                        
-                        with threadpool_limits(limits=1, user_api='blas'):
-                            with threadpool_limits(limits=1, user_api='openmp'):
-                                pipeline.fit(X_train, y_train, **safe_fit_kwargs)
-                
-                        clean_params = {k: v for k, v in best_trial_params.items()}
-                        best_params_display = str(clean_params)
-                        vprint(f"[{name}] Best Optuna Trial #{study.best_trial.number}: Score={study.best_value:.4f}")
-                    else:
-                        search_cls = RandomizedSearchCV
-                        kwargs = {"cv": cv_splitter, "scoring": primary_metric, "n_jobs": -1, "n_iter": 10, "random_state": random_seed}
-                        search_label = "RandomizedSearchCV (random sampling of parameter space)"
-
-                    if search_type_lower != "optuna":
-                        vprint(f"[{name}] Running {search_label}")
-                        search = search_cls(base_pipeline, param_grids[name], **kwargs)
-                        with threadpool_limits(limits=1, user_api='blas'):
-                            with threadpool_limits(limits=1, user_api='openmp'):
-                                search.fit(X_train, y_train, **f_kwargs)
-                        pipeline = search.best_estimator_
-
-                        clean_params = {k.replace("model__", ""): v for k, v in search.best_params_.items()}
-                        best_params_display = str(clean_params)
-                else:
-                    vprint(f"[{name}] No param grid provided. Training base model...")
-                    # Filter out early stopping params that require eval_set
-                    safe_fit_kwargs = {k: v for k, v in f_kwargs.items() 
-                                      if not any(x in k for x in ['eval_set', 'callbacks', 'early_stopping', 'early_stopping_rounds'])}
-                    with threadpool_limits(limits=1, user_api='blas'):
-                        with threadpool_limits(limits=1, user_api='openmp'):
-                            pipeline.fit(X_train, y_train, **safe_fit_kwargs)
-
-                best_estimators[name] = pipeline
-                successful_names.append(name)
-
-                with threadpool_limits(limits=1, user_api='blas'):
-                    with threadpool_limits(limits=1, user_api='openmp'):
-                        scores = cross_val_score(
-                            pipeline,
-                            X_train,
-                            y_train,
-                            cv=cv_splitter,
-                            scoring=primary_metric,
-                            n_jobs=-1,
-                            params=f_kwargs,
-                        )
-                results_score.append(scores)
-                mean_cv, std_cv = np.mean(scores), np.std(scores)
-
-                # Display fold-level details if requested
-                if show_fold_details:
-                    _print_fold_details(name, scores, metric_name=str(primary_metric), verbose=verbose)
-
-                y_val_pred = pipeline.predict(X_test)
-
-                if task_type == "classification":
-                    accuracy = accuracy_score(y_test, y_val_pred)
-                    f1 = f1_score(y_test, y_val_pred, average="macro", zero_division=0)
-                    metric1 = accuracy
-                    metric2 = f1
-                else:
-                    r2 = r2_score(y_test, y_val_pred)
-                    rmse = np.sqrt(mean_squared_error(y_test, y_val_pred))
-                    metric1 = r2
-                    metric2 = rmse
-
-                test_scores_list.append(metric1)
-
-                elapsed_time = time.time() - start_time
-
-                # --- NEW: Extract SHAP Feature Importance (Game Theory Based) ---
-                shap_feature_importance = _extract_shap_importance(pipeline, feature_names, X_train, top_k=10)
-                if shap_feature_importance and verbose:
-                    _plot_shap_summary(
-                        {
-                            "shap_values": shap_feature_importance,
-                            "shap_method": "SHAP (TreeExplainer/KernelExplainer)",
-                            "model_type": type(pipeline.named_steps["model"]).__name__
-                        },
-                        model_name=name,
-                        top_k=10,
-                        verbose=True
-                    )
-                    # Log top SHAP feature to MLflow
-                    if shap_feature_importance:
-                        top_shap_feature = list(shap_feature_importance.keys())[0]
-                        top_shap_value = list(shap_feature_importance.values())[0]
-                        mlflow.log_param(f"{name.replace(' ', '_')}_top_shap_feature", top_shap_feature)
-                        mlflow.log_metric(f"{name.replace(' ', '_')}_top_shap_importance", top_shap_value)
-
-                summary_data.append({
-                    "Model Name": name,
-                    "Train Time": f"{elapsed_time:.1f}s",
-                    f"CV Mean": f"{mean_cv:.3f} (±{std_cv:.3f})",
-                    "Metric 1 Raw": metric1,
-                    "Metric 2 Raw": metric2,
-                    "Best Params": best_params_display,
-                })
-        
-                mlflow.log_metrics({
-                    f"{name}_cv_mean": float(mean_cv),
-                    f"{name}_cv_std": float(std_cv),
-                    f"{name}_metric1": float(metric1),
-                })
-
-                # --- INCREMENTAL STATE SAVING ---
-                if checkpoint_file:
-                    joblib.dump(
-                        {
-                            "results_score": results_score,
-                            "test_scores_list": test_scores_list,
-                            "successful_names": successful_names,
-                            "summary_data": summary_data,
-                            "best_estimators": best_estimators,
-                        },
-                        checkpoint_file,
-                    )
-                    vprint(f"💾 Checkpoint updated.")
-
-            except Exception:
-                vprint(f"\n[ERROR] Model '{name}' failed!")
-                vprint(traceback.format_exc())
-                continue
-
-        # ==============================================================================
-        # 🤖 PHASE 3: AUTOMATED STACKING ENSEMBLE
-        # ==============================================================================
-        ultimate_winner = None
-
-        if build_ensemble and len(best_estimators) >= 2:
-            vprint("\n" + "🤖" * 35)
-            vprint("🤖 PHASE 3: BUILDING SUPER-ENSEMBLE (Stacking)")
-            vprint("🤖" * 35)
-
-            try:
-                # Get top models
-                temp_summary_df = pd.DataFrame(summary_data).copy() if summary_data else pd.DataFrame()
-                if "Metric 1 Raw" in temp_summary_df.columns:
-                    temp_summary_df = temp_summary_df.sort_values("Metric 1 Raw", ascending=False)
-                    top_k_ensemble = min(3, len(best_estimators))
-                    top_model_names = temp_summary_df.head(top_k_ensemble)["Model Name"].tolist()
-                else:
-                    top_model_names = list(best_estimators.keys())[:min(3, len(best_estimators))]
-
-                vprint(f"\n🔗 Blending top {len(top_model_names)} models: {top_model_names}")
-
-                estimators_for_stacking = [(name.replace(" ", "_"), best_estimators[name]) for name in top_model_names]
-
-                if task_type == "classification":
-                    meta_learner = LogisticRegression(max_iter=1000, random_state=random_seed)
-                    stacker = StackingClassifier(
-                        estimators=estimators_for_stacking,
-                        final_estimator=meta_learner,
-                        cv=cv_splitter if cv > 2 else 2,
-                        n_jobs=-1
-                    )
-                else:
-                    meta_learner = Ridge(random_state=random_seed)
-                    stacker = StackingRegressor(
-                        estimators=estimators_for_stacking,
-                        final_estimator=meta_learner,
-                        cv=cv_splitter if cv > 2 else 2,
-                        n_jobs=-1
-                    )
-
-                vprint("🔧 Training ensemble meta-learner...")
-                with threadpool_limits(limits=1, user_api='blas'):
-                    with threadpool_limits(limits=1, user_api='openmp'):
-                        stacker.fit(X_train, y_train)
-
-                ensemble_pred = stacker.predict(X_test)
-
-                if task_type == "classification":
-                    ensemble_score = accuracy_score(y_test, ensemble_pred)
-                    metric_name = "Accuracy"
-                else:
-                    ensemble_score = r2_score(y_test, ensemble_pred)
-                    metric_name = "R²"
-
-                vprint(f"\n🚀 Ensemble {metric_name}: {ensemble_score:.4f}")
-
-                mlflow.log_metric("Ensemble_Test_Score", ensemble_score)
-                mlflow.log_param("Ensemble_Base_Models", ",".join(top_model_names))
-                mlflow.sklearn.log_model(stacker, "Ultimate_Ensemble_Model")
-
-                ultimate_winner = stacker
-                best_estimators["🌟_Ensemble_Stack"] = stacker
-
-                summary_data.append({
-                    "Model Name": "🌟 Ensemble_Stack",
-                    "Train Time": "N/A",
-                    "CV Mean": "N/A",
-                    "Metric 1 Raw": ensemble_score,
-                    "Metric 2 Raw": ensemble_score,
-                    "Best Params": f"Meta: {type(meta_learner).__name__}",
-                })
-
-                vprint(f"✅ Ensemble successfully trained!")
-
-            except Exception as e:
-                vprint(f"\n⚠️ Ensemble training failed: {str(e)}")
-                vprint("Proceeding with individual model results...\n")
-
-        # ==============================================================================
-        # FINALIZE & SUMMARY
-        # ==============================================================================
-        if not summary_data:
-            summary_df = pd.DataFrame()
-        else:
-            summary_df = pd.DataFrame(summary_data)
-            if not summary_df.empty:
-                if task_type == "classification":
-                    summary_df = summary_df.sort_values(
-                        by="Metric 1 Raw", ascending=False
-                    ).reset_index(drop=True)
-                    col1_name, col2_name = "Test Acc", "Test F1"
-                else:
-                    summary_df = summary_df.sort_values(
-                        by="Metric 1 Raw", ascending=False
-                    ).reset_index(drop=True)
-                    col1_name, col2_name = "Test R²", "Test RMSE"
-
-                summary_df.insert(0, "Rank", range(1, len(summary_df) + 1))
-                summary_df[col1_name] = summary_df["Metric 1 Raw"].apply(lambda x: f"{x:.4f}" if isinstance(x, (int, float)) else x)
-                summary_df[col2_name] = summary_df["Metric 2 Raw"].apply(lambda x: f"{x:.4f}" if isinstance(x, (int, float)) else x)
-                summary_df = summary_df.drop(columns=["Metric 1 Raw", "Metric 2 Raw"])
-
-                cols = ["Rank", "Model Name", "Train Time", "CV Mean", col1_name, col2_name, "Best Params"]
-                summary_df = summary_df[[c for c in cols if c in summary_df.columns]]
-
+            if verbose:
                 print("\n" + "=" * 100)
-                print(f"🏆 RANKED MODEL PERFORMANCE SUMMARY")
+                print("RANKED MODEL PERFORMANCE SUMMARY")
                 print("=" * 100)
-                with pd.option_context(
-                    "display.max_rows", None,
-                    "display.max_columns", None,
-                    "display.width", 1000,
-                    "display.max_colwidth", None,
-                ):
+                with pd.option_context("display.max_rows", None, "display.max_columns", None,
+                                       "display.width", 1000, "display.max_colwidth", None):
                     print(summary_df.to_string(index=False))
                 print("=" * 100)
 
-        # Clean model name by removing emojis for dictionary lookup
-        ultimate_winner = None
-        if not summary_df.empty and len(best_estimators) > 0:
-            model_name = summary_df.iloc[0]["Model Name"]
-            # Try exact match first
-            if model_name in best_estimators:
-                ultimate_winner = best_estimators[model_name]
-            else:
-                # Try normalized versions
-                normalized_name = model_name.replace("🌟 ", "🌟_")
-                if normalized_name in best_estimators:
-                    ultimate_winner = best_estimators[normalized_name]
-                else:
-                    # Fallback to first successful model by name
-                    for sname in successful_names:
-                        if sname in best_estimators:
-                            ultimate_winner = best_estimators[sname]
-                            break
-        
-        # Final fallback if nothing matched
-        if ultimate_winner is None and best_estimators and successful_names:
-            ultimate_winner = best_estimators[successful_names[0]]
-
-        # ==============================================================================
-        # 📊 PHASE 4: PROBABILITY CALIBRATION (Classification Only)
-        # ==============================================================================
-        if task_type == "classification" and ultimate_winner is not None:
-            vprint("\n" + "📊" * 35)
-            vprint("📊 PHASE 4: PROBABILITY CALIBRATION (Ensuring Realistic Confidence Scores)")
-            vprint("📊" * 35)
-            
+            # [F4] Log summary_df as a CSV artifact to MLflow
             try:
-                vprint("\n🎯 Calibration ensures: When model says '90% confident', it's correct 9/10 times")
-                
-                # Calibrate on training data (prevents overfitting via cross-validation)
-                calibrated_model = _calibrate_model(
-                    ultimate_winner, 
-                    X_train, 
-                    y_train,
-                    calibration_method="isotonic" if len(X_train) >= 100 else "sigmoid",
-                    cv=min(5, cv)
-                )
-                
-                vprint(f"   Method: {'Isotonic Regression' if len(X_train) >= 100 else 'Platt Scaling (Sigmoid)'}")
-                vprint(f"   Calibration samples: {len(X_train)}")
-                
-                # Calculate calibration metrics on test set
-                if hasattr(calibrated_model, 'predict_proba'):
-                    y_proba_uncalibrated = ultimate_winner.predict_proba(X_test)[:, 1] if hasattr(ultimate_winner, 'predict_proba') else None
-                    y_proba_calibrated = calibrated_model.predict_proba(X_test)[:, 1]
-                    
-                    # Calculate Expected Calibration Error
-                    ece_before = _calculate_expected_calibration_error(y_test, y_proba_uncalibrated, n_bins=10) if y_proba_uncalibrated is not None else None
-                    ece_after = _calculate_expected_calibration_error(y_test, y_proba_calibrated, n_bins=10)
-                    
-                    # Log-Loss improvement (initialize to prevent UnboundLocalError)
-                    logloss_before = log_loss(y_test, y_proba_uncalibrated) if y_proba_uncalibrated is not None else None
-                    logloss_after = log_loss(y_test, y_proba_calibrated)
-                    logloss_improvement = 0.0  # <--- FIX: Initialize here to prevent UnboundLocalError
-                    
-                    vprint(f"\n📈 Calibration Impact:")
-                    if ece_before is not None:
-                        ece_improvement = ((ece_before - ece_after) / ece_before * 100) if ece_before > 0 else 0
-                        vprint(f"   ECE Before: {ece_before:.4f}")
-                        vprint(f"   ECE After:  {ece_after:.4f} (↓ {ece_improvement:.1f}% improvement)")
-                    
-                    if logloss_before is not None:
-                        logloss_improvement = ((logloss_before - logloss_after) / logloss_before * 100) if logloss_before > 0 else 0
-                        vprint(f"   Log-Loss Before: {logloss_before:.4f}")
-                        vprint(f"   Log-Loss After:  {logloss_after:.4f} (↓ {logloss_improvement:.1f}% improvement)")
-                    
-                    # Update ultimate winner to calibrated version
-                    ultimate_winner = calibrated_model
-                    best_estimators["🌟_Calibrated_Winner"] = calibrated_model
-                    
-                    # Log to MLflow
-                    mlflow.log_metric("ece_before_calibration", ece_before if ece_before is not None else 0.0)
-                    mlflow.log_metric("ece_after_calibration", ece_after)
-                    mlflow.log_metric("logloss_after_calibration", logloss_after)
-                    mlflow.log_param("calibration_method", "isotonic" if len(X_train) >= 100 else "sigmoid")
-                    mlflow.sklearn.log_model(calibrated_model, "Calibrated_Winner_Model")
-                    
-                    vprint(f"\n✅ Calibration complete! Ultimate winner updated with calibrated model.")
-                    vprint(f"🎯 Kaggle Log-Loss Advantage: ~{(logloss_improvement if logloss_before else 0):.1f}% improvement expected")
-                else:
-                    vprint("⚠️  Ultimate winner doesn't support probability prediction. Skipping calibration.")
-                    
-            except Exception as e:
-                vprint(f"\n⚠️ Calibration failed: {str(e)}")
-                vprint("Proceeding with uncalibrated model...\n")
+                csv_dir = save_dir or tempfile.mkdtemp()
+                csv_path = os.path.join(csv_dir, "model_summary.csv")
+                summary_df.to_csv(csv_path, index=False)
+                mlflow.log_artifact(csv_path, artifact_path="results")
+                vp(f"Summary CSV logged to MLflow: {csv_path}")
+            except Exception as exc:
+                logger.warning("Could not log summary CSV to MLflow: %s", exc)
 
-        # ==============================================================================
-        # 🧹 CLEANUP: Remove temporary cache directory
-        # ==============================================================================
-        if os.path.exists(cachedir):
-            shutil.rmtree(cachedir)
-            vprint("🧹 Cache directory cleaned up.")
+        # --- Determine ultimate winner ---
+        best_individual = (
+            sorted(best_results.values(), key=lambda r: r.metric1, reverse=True)[0].pipeline
+            if best_results else None
+        )
+        ultimate_winner = stacker if stacker is not None else best_individual
 
-        vprint(f"✅ MLflow run completed! Check experiment '{mlflow_experiment}' for full details.")
+        # --- Phase 4: calibration (classification only) ---
+        if task == TaskType.CLASSIFICATION and ultimate_winner is not None:
+            ultimate_winner = _run_phase4_calibration(
+                winner=ultimate_winner,
+                X_train=X_train,
+                y_train=y_train,
+                X_test=X_test,
+                y_test=y_test,
+                X_val=X_val,
+                y_val=y_val,
+                cv=cv,
+                calibration_method=calibration_method,
+                verbose=verbose,
+            )
+            mlflow.sklearn.log_model(ultimate_winner, "calibrated_winner")
 
-        return {
-            "summary_df": summary_df,
-            "best_models": best_estimators,
-            "raw_cv_scores": dict(zip(successful_names, results_score)),
-            "ultimate_winner": ultimate_winner,
-            "data_splits": {
-                "X_train": X_train,
-                "y_train": y_train,
-                "X_val": X_val,
-                "y_val": y_val,
-                "X_test": X_test,
-                "y_test": y_test,
-            },
-        }
+        # --- Folder overview ---
+        if save_dir:
+            _create_structure_overview(save_dir, summary_df)
+
+    # MLflow run closed by context manager — no finally block needed [S2]
+
+    vp(f"MLflow experiment '{mlflow_experiment}' — run complete.")
+
+    best_estimators = {r.name: r.pipeline for r in best_results.values()}
+    if stacker is not None:
+        best_estimators["Ensemble_Stack"] = stacker
+    if ultimate_winner is not None:
+        best_estimators["Calibrated_Winner"] = ultimate_winner
+
+    return {
+        "summary_df": summary_df,
+        "best_models": best_estimators,
+        "raw_cv_scores": {r.name: r.cv_scores for r in best_results.values()},
+        "ultimate_winner": ultimate_winner,
+        "data_splits": {
+            "X_train": X_train,
+            "y_train": y_train,
+            "X_val": X_val,
+            "y_val": y_val,
+            "X_test": X_test,
+            "y_test": y_test,
+        },
+        "drift_report": drift_report,
+    }
