@@ -1862,6 +1862,7 @@ def evaluate_and_plot_models(
     sampler: Optional[Any] = None,
     # [A2] `cv` renamed to `n_cv_folds` for clarity in the public API
     n_cv_folds: int = 4,
+    cv: Optional[int] = None,  # Deprecated: use n_cv_folds instead
     search_type: str = "grid",
     primary_metric: Optional[str] = None,
     # --- Screening ---
@@ -1946,6 +1947,7 @@ def evaluate_and_plot_models(
         [F5] Rounds without improvement before early stopping. Default 50.
     n_cv_folds
         [A2] Number of CV folds. Default 4.
+        Deprecated alias: `cv` (will be removed in v2.0).
     n_jobs
         [P2] Number of parallel jobs for CV and search. Default -1 (all cores).
     n_parallel
@@ -1997,6 +1999,16 @@ def evaluate_and_plot_models(
         split_method_enum = SplitMethod(split_method.lower())
     except ValueError:
         raise ValueError(f"split_method must be 'random' or 'sequential'. Got '{split_method}'.")
+
+    # [A2] Handle legacy `cv` parameter for backward compatibility
+    if cv is not None:
+        warnings.warn(
+            "Parameter 'cv' is deprecated; use 'n_cv_folds' instead. "
+            "'cv' will be removed in v2.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        n_cv_folds = cv
 
     # [A2] Internal variable keeps the old name for backward compat with sub-functions
     cv = n_cv_folds
