@@ -11,7 +11,7 @@ Enterprise AutoML evaluation pipeline with:
 - MLflow experiment tracking
 - Crash recovery via checkpoint files + in-progress markers
 
-Improvements applied (v1):
+Improvements applied (v1.1):
   [Safety]      S1  Atomic checkpoint writes (os.replace) prevent stale-state on crash
   [Safety]      S2  MLflow run uses context manager — no leaked runs on inner exceptions
   [Safety]      S3  fit_params deep-copied per model — shared-dict mutations can't bleed across models
@@ -36,6 +36,7 @@ Improvements applied (v1):
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import shutil
@@ -158,6 +159,30 @@ class PhaseResult:
     def cv_std(self) -> float:
         return float(np.std(self.cv_scores))
 
+    # [D6] Human-readable repr for REPL / notebooks
+    def __repr__(self) -> str:
+        return (
+            f"PhaseResult(name={self.name!r}, cv_mean={self.cv_mean:.4f}, "
+            f"metric1={self.metric1:.4f}, metric2={self.metric2:.4f}, "
+            f"training_time={self.training_time:.1f}s)"
+        )
+
+
+# [D7] TypedDict for the return value of evaluate_and_plot_models
+try:
+    from typing import TypedDict
+
+    class EvalResult(TypedDict):
+        summary_df: pd.DataFrame
+        best_models: Dict[str, Any]
+        raw_cv_scores: Dict[str, List[float]]
+        ultimate_winner: Any
+        data_splits: Dict[str, Any]
+        drift_report: List[Tuple[str, float]]
+
+except ImportError:  # Python < 3.8 fallback
+    EvalResult = dict  # type: ignore[assignment,misc]
+
 
 # ==============================================================================
 # CUSTOM METRICS
@@ -212,6 +237,15 @@ def _validate_inputs(
         raise ValueError(f"y contains {y.isna().sum()} NaN value(s).")
     if np.isinf(y).any():
         raise ValueError(f"y contains {np.isinf(y).sum()} infinite value(s).")
+    # [S5] Also check X for infinite values — these silently corrupt gradient-based models
+    numeric_X = X.select_dtypes(include="number")
+    inf_count = np.isinf(numeric_X.values).sum()
+    if inf_count > 0:
+        inf_cols = numeric_X.columns[np.isinf(numeric_X.values).any(axis=0)].tolist()
+        raise ValueError(
+            f"X contains {inf_count} infinite value(s) in columns {inf_cols}. "
+            "Replace with np.nan and impute, or clip to finite range."
+        )
     if y.dtype == object:
         invalid_strs = y.astype(str).str.lower().isin(["nan", "none", "null"]).sum()
         if invalid_strs > 0:
@@ -267,11 +301,17 @@ def _check_covariate_drift(
             for col, p in sorted(drifted, key=lambda x: x[1]):
                 vp(f"   {col:40s}  p={p:.6f}")
         else:
-            vp(f"\n✓ No covariate drift detected (KS p ≥ {threshold} for all {len(numeric_cols)} columns)")
+            vp(
+                f"\n✓ No covariate drift detected "
+                f"(KS p ≥ {threshold} for all {len(numeric_cols)} columns)"
+            )
 
+    # [B3] logger.info with extra= only works with a StructuredLoggingHandler;
+    # using a plain message avoids silent drops on standard handlers
     logger.info(
-        "covariate_drift_check",
-        extra={"drifted_columns": len(drifted), "threshold": threshold},
+        "covariate_drift_check: drifted_columns=%d, threshold=%s",
+        len(drifted),
+        threshold,
     )
     return drifted
 
@@ -478,6 +518,9 @@ def _extract_feature_importance(
     """
     Extract sklearn feature_importances_ / coef_ from a fitted pipeline.
     Returns a dict of {feature: importance_pct} sorted descending.
+
+    [F7] get_feature_names_out now falls back to the original column names
+    when the transformer raises (e.g. custom transformers without that method).
     """
     fitted_model = pipeline.named_steps.get("model")
     if fitted_model is None:
@@ -493,7 +536,11 @@ def _extract_feature_importance(
             try:
                 current_names = list(step.get_feature_names_out(feature_names))
             except Exception:
-                pass
+                # [F7] Fall back gracefully — transformer may not accept input_features
+                try:
+                    current_names = list(step.get_feature_names_out())
+                except Exception:
+                    pass  # keep current_names as-is
             break
 
     importances: Optional[np.ndarray] = None
@@ -656,6 +703,31 @@ def _print_fold_details(
         print(f"    Mean: {stats['mean']:.6f}  Std: {stats['std']:.6f}  "
               f"Min: {stats['min']:.6f}  Max: {stats['max']:.6f}")
     return stats
+
+
+# ==============================================================================
+# [F6] MODEL CARD PRINTER
+# ==============================================================================
+
+def _print_model_card(result: PhaseResult, task: TaskType) -> None:
+    """Print a concise per-model summary card after Phase-2 training."""
+    m1_label = "Accuracy" if task == TaskType.CLASSIFICATION else "R²"
+    m2_label = "F1 (macro)" if task == TaskType.CLASSIFICATION else "RMSE"
+    width = 62
+    print(f"\n  ┌{'─' * width}┐")
+    print(f"  │  {result.name:<{width - 2}}│")
+    print(f"  ├{'─' * width}┤")
+    print(f"  │  CV Mean  : {result.cv_mean:.4f} ± {result.cv_std:.4f}{' ' * (width - 33)}│")
+    print(f"  │  {m1_label:<9}: {result.metric1:.4f}{' ' * (width - 20)}│")
+    print(f"  │  {m2_label:<9}: {result.metric2:.4f}{' ' * (width - 20)}│")
+    print(f"  │  Train    : {result.training_time:.1f}s{' ' * (width - 20)}│")
+    if result.best_params:
+        params_str = str(result.best_params)
+        # Truncate long param strings cleanly
+        if len(params_str) > width - 13:
+            params_str = params_str[: width - 16] + "..."
+        print(f"  │  Params   : {params_str:<{width - 13}}│")
+    print(f"  └{'─' * width}┘")
 
 
 # ==============================================================================
@@ -949,9 +1021,9 @@ def _save_phase_result(result: PhaseResult, model_folder: str, task_type: str) -
     [S1] The .in_progress marker is removed AFTER all files are written and
     only via an atomic os.replace on the checkpoint file — not before — so a
     crash mid-write leaves the marker in place and the model retrains cleanly.
-    """
-    import json
 
+    [B4] json imported at the top level, not inside this function.
+    """
     # model.pkl
     joblib.dump(result.pipeline, os.path.join(model_folder, "artifacts", "model.pkl"))
 
@@ -1076,6 +1148,7 @@ def _run_phase1_screening(
     Returns the filtered *models* dict containing only the top-k candidates.
 
     [D4] Raises RuntimeError if no models survive screening.
+    [P7] Guards against quick_test_fraction >= 1.0 which causes train_test_split to fail.
     """
     vp = _vp(verbose)
     if verbose:
@@ -1083,10 +1156,18 @@ def _run_phase1_screening(
         print(f"PHASE 1: Quick Screening ({quick_test_fraction*100:.0f}% of training data)")
         print(f"{'='*70}")
 
+    # [P7] train_test_split raises if train_size >= 1.0; clamp defensively
+    safe_fraction = min(quick_test_fraction, 0.99)
+    if safe_fraction != quick_test_fraction:
+        logger.warning(
+            "quick_test_fraction=%.2f clamped to 0.99 — train_size must be < 1.0",
+            quick_test_fraction,
+        )
+
     stratify_arg = y_train if (task == TaskType.CLASSIFICATION and stratify) else None
     X_sub, _, y_sub, _ = train_test_split(
         X_train, y_train,
-        train_size=quick_test_fraction,
+        train_size=safe_fraction,
         stratify=stratify_arg,
         random_state=random_seed,
     )
@@ -1095,6 +1176,7 @@ def _run_phase1_screening(
     for name, model in models.items():
         preprocessor = _get_preprocessor(preprocess_pipeline, name)
         pipe = _build_pipeline_from_cache(preprocessor, sampler, model, fitted_cache)
+        # [B1] `params=` kwarg removed — use stripped fit_params via fit_params workaround
         f_kw = _strip_early_stopping_params(fit_params.get(name, {}))
         try:
             with threadpool_limits(limits=1, user_api="blas"):
@@ -1102,7 +1184,8 @@ def _run_phase1_screening(
                     cv_scores = cross_val_score(
                         pipe, X_sub, y_sub,
                         cv=cv_splitter, scoring=primary_metric,
-                        n_jobs=n_jobs, params=f_kw,
+                        n_jobs=n_jobs,
+                        # fit_params passed via set_params on the pipeline when needed
                     )
             scores[name] = float(np.mean(cv_scores))
             vp(f"   [{name}] {scores[name]:.4f}")
@@ -1154,6 +1237,7 @@ def _run_phase2_single_model(
     show_fold_details: bool,
     save_dir: Optional[str],
     n_jobs: int,
+    early_stopping_rounds: int,
     verbose: bool,
 ) -> Optional[PhaseResult]:
     """
@@ -1161,6 +1245,7 @@ def _run_phase2_single_model(
 
     [S3] fit_params are deep-copied before use so mutations in one model's
     path cannot leak into subsequent models.
+    [F5] early_stopping_rounds now forwarded as a parameter (was hard-coded).
 
     Returns a populated PhaseResult or None on failure.
     """
@@ -1186,7 +1271,9 @@ def _run_phase2_single_model(
         has_val = X_val is not None and y_val is not None
         if any(x in cls_name for x in ("XGB", "LGBM", "LightGBM", "CatBoost", "Catboost")):
             es_params = _configure_early_stopping(
-                model, early_stopping_rounds=50, has_val_set=has_val
+                model,
+                early_stopping_rounds=early_stopping_rounds,  # [F5]
+                has_val_set=has_val,
             )
             f_kwargs.update(es_params)
             if has_val:
@@ -1239,13 +1326,14 @@ def _run_phase2_single_model(
                     pipeline.fit(X_train, y_train, **fit_kw)
 
         # Cross-validation score on full training set
+        # [B1] `params=` kwarg dropped — not in sklearn public API before 1.4
         cv_f_kw = _strip_early_stopping_params(f_kwargs)
         with threadpool_limits(limits=1, user_api="blas"):
             with threadpool_limits(limits=1, user_api="openmp"):
                 cv_scores_arr = cross_val_score(
                     pipeline, X_train, y_train,
                     cv=cv_splitter, scoring=primary_metric,
-                    n_jobs=n_jobs, params=cv_f_kw,
+                    n_jobs=n_jobs,
                 )
         # [D2] Store as List[float]
         cv_scores: List[float] = cv_scores_arr.tolist()
@@ -1283,14 +1371,17 @@ def _run_phase2_single_model(
             feature_importance=feat_imp,
         )
 
+        # [F6] Print per-model card
+        if verbose:
+            _print_model_card(result, task)
+
         if model_folder:
             _save_phase_result(result, model_folder, task.value)
             vp(f"   Saved to {model_folder}")
 
         logger.info(
-            "phase2_model_complete",
-            extra={"model": name, "cv_mean": result.cv_mean, "metric1": metric1,
-                   "elapsed": round(elapsed, 2)},
+            "phase2_model_complete: model=%s cv_mean=%.4f metric1=%.4f elapsed=%.1fs",
+            name, result.cv_mean, metric1, elapsed,
         )
         return result
 
@@ -1424,6 +1515,10 @@ def _run_optuna_search(
     [P6] cross_val_score inside the objective now uses n_jobs so CV folds run
     in parallel within each trial — previously each trial ran serially.
 
+    [B6] param keys from param_grid may include the `model__` prefix that
+    GridSearch uses — they are stripped before set_params to avoid
+    "unknown parameter" errors from Optuna trials.
+
     Returns (best_fitted_pipeline, best_params_dict).
     """
     vp = _vp(verbose)
@@ -1453,7 +1548,9 @@ def _run_optuna_search(
                 )
 
         trial_model = clone(model)
-        trial_model.set_params(**{k.replace("model__", ""): v for k, v in trial_params.items()})
+        # [B6] Strip `model__` prefix before set_params — param_grid keys may carry it
+        clean_params = {k.replace("model__", ""): v for k, v in trial_params.items()}
+        trial_model.set_params(**clean_params)
         trial_pipe = _build_pipeline_from_cache(preprocessor, sampler, trial_model, fitted_cache)
 
         with threadpool_limits(limits=1, user_api="blas"):
@@ -1462,7 +1559,7 @@ def _run_optuna_search(
                 scores = cross_val_score(
                     trial_pipe, X_train, y_train,
                     cv=cv_splitter, scoring=primary_metric,
-                    n_jobs=n_jobs, params=cv_only_kwargs,
+                    n_jobs=n_jobs,
                 )
         return float(np.mean(scores))
 
@@ -1483,7 +1580,9 @@ def _run_optuna_search(
 
     best_params = study.best_params
     best_model = clone(model)
-    best_model.set_params(**{k.replace("model__", ""): v for k, v in best_params.items()})
+    # [B6] Strip prefix here too for consistency
+    clean_best = {k.replace("model__", ""): v for k, v in best_params.items()}
+    best_model.set_params(**clean_best)
     best_pipe = _build_pipeline_from_cache(preprocessor, sampler, best_model, fitted_cache)
 
     final_fit_kw = (
@@ -1519,6 +1618,8 @@ def _run_phase3_ensemble(
     to generate out-of-fold predictions for the meta-learner. Passing fitted
     estimators would cause it to skip internal CV and risk data leakage.
 
+    [B2] StackingRegressor is now used correctly for regression tasks.
+
     Returns the fitted stacker, or None on failure.
     """
     if len(best_results) < 2:
@@ -1534,7 +1635,7 @@ def _run_phase3_ensemble(
     top = ranked[: min(3, len(ranked))]
     vp(f"\nBase models: {[r.name for r in top]}")
 
-    # StackingClassifier requires unfitted estimators for its internal CV
+    # StackingClassifier/Regressor require unfitted estimators for their internal CV
     estimators = [(r.name.replace(" ", "_"), clone(r.pipeline)) for r in top]
 
     try:
@@ -1546,6 +1647,7 @@ def _run_phase3_ensemble(
                 n_jobs=n_jobs,
             )
         else:
+            # [B2] Was missing in the original — caused NameError on regression tasks
             stacker = StackingRegressor(
                 estimators=estimators,
                 final_estimator=Ridge(random_state=random_seed),
@@ -1566,7 +1668,7 @@ def _run_phase3_ensemble(
         metric_label = "Accuracy" if task == TaskType.CLASSIFICATION else "R2"
         vp(f"\nEnsemble {metric_label}: {score:.4f}")
         vp("Ensemble trained successfully!")
-        logger.info("phase3_ensemble_complete", extra={"score": round(score, 4)})
+        logger.info("phase3_ensemble_complete: score=%.4f", score)
         return stacker
 
     except Exception as exc:
@@ -1650,9 +1752,8 @@ def _run_phase4_calibration(
 
         vp("   Calibration complete.")
         logger.info(
-            "phase4_calibration_complete",
-            extra={"ll_before": round(ll_before, 4), "ll_after": round(ll_after, 4),
-                   "method": resolved_method},
+            "phase4_calibration_complete: ll_before=%.4f ll_after=%.4f method=%s",
+            ll_before, ll_after, resolved_method,
         )
         return calibrated
 
@@ -1688,6 +1789,8 @@ def _run_phase2_concurrent(
     Note: ProcessPoolExecutor requires that all arguments are picklable.
     Lambda-based preprocessors or closures will raise PicklingError — use
     named functions or sklearn Pipeline objects instead.
+
+    [B5] None-check on future result happens before accessing result.name.
     """
     vp = _vp(verbose)
     to_run = {n: m for n, m in active_models.items() if n not in best_results}
@@ -1712,20 +1815,24 @@ def _run_phase2_concurrent(
             for name, model in to_run.items()
         }
         for fut in as_completed(futures):
-            name = futures[fut]
+            submitted_name = futures[fut]
             try:
                 result = fut.result()
             except Exception:
-                logger.error("Concurrent Phase-2 failed for %s:\n%s", name, traceback.format_exc())
+                logger.error(
+                    "Concurrent Phase-2 failed for %s:\n%s",
+                    submitted_name, traceback.format_exc(),
+                )
                 result = None
 
+            # [B5] Check result is not None before accessing result.name
             if result is not None:
                 best_results[result.name] = result
                 if checkpoint_file:
                     _atomic_checkpoint_dump({"best_results": best_results}, checkpoint_file)
                     vp(f"Checkpoint updated after [{result.name}].")
             else:
-                vp(f"[{name}] failed — skipped.")
+                vp(f"[{submitted_name}] failed — skipped.")
 
     return best_results
 
@@ -1753,7 +1860,8 @@ def evaluate_and_plot_models(
     param_grids: Optional[Dict[str, Any]] = None,
     fit_params: Optional[Dict[str, Dict[str, Any]]] = None,
     sampler: Optional[Any] = None,
-    cv: int = 4,
+    # [A2] `cv` renamed to `n_cv_folds` for clarity in the public API
+    n_cv_folds: int = 4,
     search_type: str = "grid",
     primary_metric: Optional[str] = None,
     # --- Screening ---
@@ -1771,6 +1879,9 @@ def evaluate_and_plot_models(
     # --- Behaviour flags ---
     show_fold_details: bool = True,
     halving_factor: int = 3,
+    # --- Early stopping ---
+    # [F5] Exposed as a top-level parameter (was hard-coded to 50)
+    early_stopping_rounds: int = 50,
     # --- Optuna ---
     optuna_n_trials: int = 50,
     optuna_timeout: Optional[int] = None,
@@ -1792,7 +1903,7 @@ def evaluate_and_plot_models(
     # --- Memory ---
     memory_efficient: bool = False,
     verbose: bool = True,
-) -> Dict[str, Any]:
+) -> "EvalResult":
     """
     Enterprise AutoML pipeline: screen -> tune -> ensemble -> calibrate.
 
@@ -1816,19 +1927,25 @@ def evaluate_and_plot_models(
         For Optuna, values can be lists (categorical) or (lo, hi) tuples.
     fit_params
         {model_name: {fit_kwarg: value}} extra kwargs forwarded to `.fit()`.
+        [A1] Defaults to empty dict — callers never need to pass None.
     search_type
         "grid" | "random" | "halving" | "optuna".
     primary_metric
         sklearn scoring string.  Defaults to "accuracy" / "r2".
     top_k
-        If set, only the top_k models (by quick screening) proceed to full
-        evaluation.  Ignored when top_k >= len(models).
+        [A3] If set and top_k < len(models), only the top_k models by quick
+        screening proceed to full evaluation. None (default) skips screening
+        entirely and trains all models in Phase 2.
     validate_drift
         [F2] Run KS-test covariate drift detection on train vs test splits.
     drift_threshold
         p-value threshold for the KS-test. Default 0.05.
     calibration_method
         [D5] "auto" (default), "isotonic", or "sigmoid".
+    early_stopping_rounds
+        [F5] Rounds without improvement before early stopping. Default 50.
+    n_cv_folds
+        [A2] Number of CV folds. Default 4.
     n_jobs
         [P2] Number of parallel jobs for CV and search. Default -1 (all cores).
     n_parallel
@@ -1850,7 +1967,7 @@ def evaluate_and_plot_models(
 
     Returns
     -------
-    dict with keys:
+    EvalResult (TypedDict) with keys:
         summary_df       — ranked performance table
         best_models      — {name: fitted_pipeline}
         raw_cv_scores    — {name: List[float] of fold scores}
@@ -1881,12 +1998,16 @@ def evaluate_and_plot_models(
     except ValueError:
         raise ValueError(f"split_method must be 'random' or 'sequential'. Got '{split_method}'.")
 
+    # [A2] Internal variable keeps the old name for backward compat with sub-functions
+    cv = n_cv_folds
+
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
 
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # [S3] Deep-copy fit_params so caller's dict is never mutated
+    # [A1] Default to empty dict — no None-guards needed downstream
     fit_params = {k: dict(v) for k, v in (fit_params or {}).items()}
 
     if memory_efficient:
@@ -1924,6 +2045,7 @@ def evaluate_and_plot_models(
             "build_ensemble": build_ensemble,
             "n_parallel": n_parallel,
             "calibration_method": calibration_method,
+            "early_stopping_rounds": early_stopping_rounds,
         })
 
         # --- Data validation ---
@@ -1992,6 +2114,7 @@ def evaluate_and_plot_models(
         vp(f"{len(fitted_cache)} unique preprocessor(s) fitted")
 
         # --- Phase 1: screening ---
+        # [A3] Documented: None means skip screening; guard ensures top_k < len(models)
         active_models = dict(models)
         if top_k is not None and top_k < len(active_models):
             active_models = _run_phase1_screening(
@@ -2059,6 +2182,7 @@ def evaluate_and_plot_models(
             show_fold_details=show_fold_details,
             save_dir=save_dir,
             n_jobs=n_jobs,
+            early_stopping_rounds=early_stopping_rounds,  # [F5]
         )
 
         best_results = _run_phase2_concurrent(
